@@ -45,40 +45,39 @@
     <option name="hideEmptyMiddlePackages" value="true" />
     <option name="showLibraryContents" value="true" />
   </component>
-  <component name="PropertiesComponent">{
-  &quot;keyToString&quot;: {
-    &quot;DefaultHtmlFileTemplate&quot;: &quot;HTML File&quot;,
-    &quot;ModuleVcsDetector.initialDetectionPerformed&quot;: &quot;true&quot;,
-    &quot;Python.api_client_example.executor&quot;: &quot;Run&quot;,
-    &quot;Python.app.executor&quot;: &quot;Run&quot;,
-    &quot;Python.data_generation.executor&quot;: &quot;Run&quot;,
-    &quot;Python.demo.executor&quot;: &quot;Run&quot;,
-    &quot;Python.model_training.executor&quot;: &quot;Run&quot;,
-    &quot;Python.model_tuning.executor&quot;: &quot;Run&quot;,
-    &quot;Python.pre_processed (1).executor&quot;: &quot;Run&quot;,
-    &quot;Python.pre_processed.executor&quot;: &quot;Run&quot;,
-    &quot;Python.prediction_model.executor&quot;: &quot;Run&quot;,
-    &quot;Python.rebalance_data.executor&quot;: &quot;Run&quot;,
-    &quot;Python.rockfall_api.executor&quot;: &quot;Run&quot;,
-    &quot;Python.simple_api.executor&quot;: &quot;Run&quot;,
-    &quot;Python.train_models.executor&quot;: &quot;Run&quot;,
-    &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
-    &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
-    &quot;git-widget-placeholder&quot;: &quot;master&quot;,
-    &quot;last_opened_file_path&quot;: &quot;C:/Users/patil/PycharmProjects/PythonProject1/dashboard-react/public&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;reference.settings.ide.settings.web.browsers&quot;
+  <component name="PropertiesComponent"><![CDATA[{
+  "keyToString": {
+    "DefaultHtmlFileTemplate": "HTML File",
+    "ModuleVcsDetector.initialDetectionPerformed": "true",
+    "Python.api_client_example.executor": "Run",
+    "Python.app.executor": "Run",
+    "Python.data_generation.executor": "Run",
+    "Python.demo.executor": "Run",
+    "Python.model_training.executor": "Run",
+    "Python.model_tuning.executor": "Run",
+    "Python.pre_processed (1).executor": "Run",
+    "Python.pre_processed.executor": "Run",
+    "Python.prediction_model.executor": "Run",
+    "Python.rebalance_data.executor": "Run",
+    "Python.rockfall_api.executor": "Run",
+    "Python.simple_api.executor": "Run",
+    "Python.train_models.executor": "Run",
+    "RunOnceActivity.ShowReadmeOnStart": "true",
+    "RunOnceActivity.git.unshallow": "true",
+    "last_opened_file_path": "C:/Users/patil/PycharmProjects/PythonProject1/dashboard-react/public",
+    "settings.editor.selected.configurable": "reference.settings.ide.settings.web.browsers"
   },
-  &quot;keyToStringList&quot;: {
-    &quot;ChangesTree.GroupingKeys&quot;: [
-      &quot;directory&quot;,
-      &quot;repository&quot;
+  "keyToStringList": {
+    "ChangesTree.GroupingKeys": [
+      "directory",
+      "repository"
     ],
-    &quot;GitStage.ChangesTree.GroupingKeys&quot;: [
-      &quot;directory&quot;,
-      &quot;repository&quot;
+    "GitStage.ChangesTree.GroupingKeys": [
+      "directory",
+      "repository"
     ]
   }
-}</component>
+}]]></component>
   <component name="RecentsManager">
     <key name="CopyFile.RECENT_KEYS">
       <recent name="C:\Users\patil\PycharmProjects\PythonProject1\dashboard-react\public" />
