@@ -1,0 +1,1964 @@
+Index: models/app.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>from flask import Flask, render_template, jsonify, request\r\nimport numpy as np\r\nimport joblib\r\nimport os\r\nimport pandas as pd\r\nfrom datetime import datetime\r\nimport random\r\nimport requests\r\n\r\napp = Flask(__name__, static_folder=\"static\", template_folder=\"templates\")\r\n\r\n# MODEL LOADING\r\nbase_path = os.path.abspath(os.path.dirname(__file__))\r\nbest_models_dir = os.path.join(base_path, \"best_models\")\r\n\r\nbinary_model_path = os.path.join(best_models_dir, 'rockfall_binary_model.pkl')\r\nmulticlass_model_path = os.path.join(best_models_dir, 'rockfall_multiclass_model.pkl')\r\nlabel_encoder_path = os.path.join(best_models_dir, 'rockfall_label_encoder.pkl')\r\n\r\nbest_binary_model = joblib.load(binary_model_path)\r\nbest_multiclass_model = joblib.load(multiclass_model_path)\r\nle = joblib.load(label_encoder_path)\r\n\r\nfeature_columns = [\r\n    'slope_height_m', 'slope_angle_deg', 'cohesion_kpa', 'friction_angle_deg',\r\n    'unit_weight_kn_m3', 'rqd_percent', 'joint_spacing_m', 'rainfall_mm',\r\n    'temperature_range_c', 'groundwater_depth_m', 'freeze_thaw_cycles',\r\n    'blasting_distance_m', 'vibration_intensity', 'days_since_blast',\r\n    'mining_depth_m', 'days_since_rain', 'season_encoded',\r\n    'stability_index', 'weather_risk_score', 'operational_stress',\r\n    'geological_weakness', 'slope_steepness_factor'\r\n]\r\n\r\nlatest_sensor_data = {}\r\nprediction_history = []\r\nsensor_history = []\r\n\r\ndef calculate_derived_features(input_features):\r\n    stability_index = (input_features.get('cohesion_kpa', 30) +\r\n                       input_features.get('unit_weight_kn_m3', 24) *\r\n                       input_features.get('slope_height_m', 50) *\r\n                       np.tan(np.radians(input_features.get('friction_angle_deg', 35)))) / \\\r\n                      (input_features.get('unit_weight_kn_m3', 24) *\r\n                       input_features.get('slope_height_m', 50) *\r\n                       np.sin(np.radians(input_features.get('slope_angle_deg', 45))))\r\n\r\n    weather_risk = (input_features.get('rainfall_mm', 10) *\r\n                    input_features.get('temperature_range_c', 15)) / \\\r\n                   (input_features.get('days_since_rain', 5) + 1)\r\n\r\n    operational_stress = input_features.get('vibration_intensity', 3) / \\\r\n                         (input_features.get('blasting_distance_m', 100) + 1) * \\\r\n                         (60 - input_features.get('days_since_blast', 7)) / 60\r\n\r\n    geological_weakness = (100 - input_features.get('rqd_percent', 60)) / \\\r\n                         input_features.get('joint_spacing_m', 1.5)\r\n\r\n    slope_steepness = np.tan(np.radians(input_features.get('slope_angle_deg', 45))) * \\\r\n                      input_features.get('slope_height_m', 50)\r\n\r\n    return {\r\n        'stability_index': stability_index,\r\n        'weather_risk_score': weather_risk,\r\n        'operational_stress': operational_stress,\r\n        'geological_weakness': geological_weakness,\r\n        'slope_steepness_factor': slope_steepness\r\n    }\r\n\r\ndef prepare_feature_dataframe(input_features):\r\n    base_features = {k: input_features.get(k, 0) for k in feature_columns[:-5]}\r\n    derived_features = calculate_derived_features(input_features)\r\n    all_features = {**base_features, **derived_features}\r\n    df = pd.DataFrame([all_features], columns=feature_columns)\r\n    return df\r\n\r\ndef predict_binary(input_features):\r\n    feature_df = prepare_feature_dataframe(input_features)\r\n    prediction = best_binary_model.predict(feature_df)[0]\r\n    prob = best_binary_model.predict_proba(feature_df)[0][1]\r\n    if prob > 0.4:\r\n        risk_level = \"CRITICAL\"\r\n        recommendation = \"Immediate evacuation required. Stop all operations.\"\r\n    elif prob > 0.3:\r\n        risk_level = \"HIGH\"\r\n        recommendation = \"High risk detected. Consider evacuation.\"\r\n    elif prob > 0.1:\r\n        risk_level = \"MEDIUM\"\r\n        recommendation = \"Moderate risk. Increase monitoring.\"\r\n    else:\r\n        risk_level = \"LOW\"\r\n        recommendation = \"Low risk. Continue regular monitoring.\"\r\n    return {\r\n        'prediction': int(prediction),\r\n        'risk_level': risk_level,\r\n        'confidence': round(float(prob), 2),\r\n        'recommendation': recommendation\r\n    }\r\n\r\ndef predict_multiclass(input_features):\r\n    feature_df = prepare_feature_dataframe(input_features)\r\n    prediction_encoded = best_multiclass_model.predict(feature_df)[0]\r\n    probabilities = best_multiclass_model.predict_proba(feature_df)[0]\r\n    prediction_label = le.inverse_transform([prediction_encoded])[0]\r\n    confidence = round(float(max(probabilities)), 2)\r\n    return {\r\n        'prediction_label': prediction_label,\r\n        'confidence': confidence\r\n    }\r\n\r\n@app.route('/')\r\ndef dashboard():\r\n    return render_template('index.html')\r\n\r\n@app.route('/api/sensor-data')\r\ndef get_sensor_data():\r\n    try:\r\n        response = requests.get('http://localhost:5000/simulate-sensor-data', timeout=2)\r\n        sensor_data = response.json()\r\n        global latest_sensor_data, sensor_history\r\n        latest_sensor_data = sensor_data\r\n        sensor_history.append({\r\n            'timestamp': sensor_data['timestamp'],\r\n            'slope_height_m': sensor_data['slope_height_m'],\r\n            'rainfall_mm': sensor_data['rainfall_mm'],\r\n            'vibration_intensity': sensor_data['vibration_intensity'],\r\n            'rqd_percent': sensor_data['rqd_percent']\r\n        })\r\n        if len(sensor_history) > 50: sensor_history.pop(0)\r\n        return jsonify(sensor_data)\r\n    except Exception as e:\r\n        if latest_sensor_data:\r\n            return jsonify(latest_sensor_data)\r\n        return jsonify({'error': 'Sensor data not available', 'details': str(e)}), 503\r\n\r\n@app.route('/api/predict')\r\ndef get_prediction():\r\n    global latest_sensor_data, prediction_history\r\n    if not latest_sensor_data:\r\n        return jsonify({'error': 'No sensor data available'}), 400\r\n    try:\r\n        binary_result = predict_binary(latest_sensor_data)\r\n        multiclass_result = predict_multiclass(latest_sensor_data)\r\n        prediction_result = {\r\n            'timestamp': latest_sensor_data.get('timestamp', datetime.now().isoformat()),\r\n            'binary_result': binary_result,\r\n            'multiclass_result': multiclass_result,\r\n            'sensor_data': latest_sensor_data\r\n        }\r\n        prediction_history.append({\r\n            'timestamp': prediction_result['timestamp'],\r\n            'risk_level': binary_result['risk_level'],\r\n            'confidence': binary_result['confidence'],\r\n            'prediction_label': multiclass_result['prediction_label']\r\n        })\r\n        if len(prediction_history) > 50: prediction_history.pop(0)\r\n        return jsonify(prediction_result)\r\n    except Exception as e:\r\n        return jsonify({'error': 'Prediction failed', 'details': str(e)}), 500\r\n\r\n@app.route('/api/history')\r\ndef get_history():\r\n    return jsonify({\r\n        'sensor_history': sensor_history,\r\n        'prediction_history': prediction_history\r\n    })\r\n\r\nif __name__ == '__main__':\r\n    print(\"Starting dashboard server on http://localhost:8080\")\r\n    app.run(debug=True, port=8080)\r\n
+===================================================================
+diff --git a/models/app.py b/models/app.py
+--- a/models/app.py	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/app.py	(date 1758541050099)
+@@ -1,15 +1,17 @@
+-from flask import Flask, render_template, jsonify, request
+-import numpy as np
+-import joblib
+ import os
+-import pandas as pd
+ from datetime import datetime
+-import random
++
++import joblib
++import numpy as np
++import pandas as pd
+ import requests
++from flask import Flask, render_template, jsonify
++from flask_cors import CORS
+ 
+ app = Flask(__name__, static_folder="static", template_folder="templates")
++CORS(app)
+ 
+-# MODEL LOADING
++# Model loading paths - update according to your structure
+ base_path = os.path.abspath(os.path.dirname(__file__))
+ best_models_dir = os.path.join(base_path, "best_models")
+ 
+@@ -114,7 +116,9 @@
+ @app.route('/api/sensor-data')
+ def get_sensor_data():
+     try:
+-        response = requests.get('http://localhost:5000/simulate-sensor-data', timeout=2)
++        # Update backend API IP here to your actual Flask backend IP
++        backend_api_url = 'http://10.115.150.220:5000/simulate-sensor-data'
++        response = requests.get(backend_api_url, timeout=2)
+         sensor_data = response.json()
+         global latest_sensor_data, sensor_history
+         latest_sensor_data = sensor_data
+Index: dataset/pre_processed.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+># Step 4: Data Preprocessing and Feature Selection\r\nimport pandas as pd\r\nimport numpy as np\r\nfrom sklearn.model_selection import train_test_split\r\nfrom sklearn.preprocessing import StandardScaler, LabelEncoder\r\nimport joblib\r\nprint(\"=== STEP 4: DATA PREPROCESSING ===\")\r\n# Load dataset CSV into df\r\ndf = pd.read_csv('rockfall_synthetic_dataset.csv')\r\n\r\n# Select features for the model (remove categorical and intermediate features)\r\nfeature_columns = [\r\n    'slope_height_m', 'slope_angle_deg', 'cohesion_kpa', 'friction_angle_deg',\r\n    'unit_weight_kn_m3', 'rqd_percent', 'joint_spacing_m', 'rainfall_mm',\r\n    'temperature_range_c', 'groundwater_depth_m', 'freeze_thaw_cycles',\r\n    'blasting_distance_m', 'vibration_intensity', 'days_since_blast',\r\n    'mining_depth_m', 'days_since_rain', 'season_encoded',\r\n    'stability_index', 'weather_risk_score', 'operational_stress',\r\n    'geological_weakness', 'slope_steepness_factor'\r\n]\r\n\r\n# Prepare data for modeling\r\nX = df[feature_columns]\r\ny_binary = df['rockfall_binary']\r\ny_multiclass = df['risk_level']\r\n\r\nprint(f\"Features selected: {len(feature_columns)}\")\r\nprint(f\"Feature columns: {feature_columns}\")\r\n\r\n# Split the data\r\nX_train, X_test, y_train_bin, y_test_bin = train_test_split(\r\n    X, y_binary, test_size=0.3, random_state=42, stratify=y_binary\r\n)\r\n\r\n# Split for multiclass (encode labels first)\r\nle = LabelEncoder()\r\ny_multiclass_encoded = le.fit_transform(y_multiclass)\r\nX_train_mc, X_test_mc, y_train_mc, y_test_mc = train_test_split(\r\n    X, y_multiclass_encoded, test_size=0.3, random_state=42, stratify=y_multiclass_encoded\r\n)\r\n\r\n# Scale the features\r\nscaler = StandardScaler()\r\nX_train_scaled = scaler.fit_transform(X_train)\r\nX_test_scaled = scaler.transform(X_test)\r\n\r\nX_train_mc_scaled = scaler.fit_transform(X_train_mc)\r\nX_test_mc_scaled = scaler.transform(X_test_mc)\r\n\r\nprint(f\"Training set size: {X_train.shape}\")\r\nprint(f\"Test set size: {X_test.shape}\")\r\nprint(f\"Binary target distribution in training: {np.bincount(y_train_bin)}\")\r\nprint(\"\\nData preprocessing complete!\")\r\n\r\n# Save the scaler and label encoder for later use\r\njoblib.dump(scaler, '../models/best_models/rockfall_scaler.pkl')\r\njoblib.dump(le, '../models/best_models/rockfall_label_encoder.pkl')\r\n\r\n# Save data splits and scaled versions\r\njoblib.dump(X_train, '../models/X_train.pkl')\r\njoblib.dump(X_test, '../models/X_test.pkl')\r\njoblib.dump(y_train_bin, '../models/y_train_bin.pkl')\r\njoblib.dump(y_test_bin, '../models/y_test_bin.pkl')\r\njoblib.dump(X_train_scaled, '../models/X_train_scaled.pkl')\r\njoblib.dump(X_test_scaled, '../models/X_test_scaled.pkl')\r\n\r\njoblib.dump(X_train_mc, '../models/X_train_mc.pkl')\r\njoblib.dump(X_test_mc, '../models/X_test_mc.pkl')\r\njoblib.dump(y_train_mc, '../models/y_train_mc.pkl')\r\njoblib.dump(y_test_mc, '../models/y_test_mc.pkl')\r\njoblib.dump(X_train_mc_scaled, '../models/X_train_mc_scaled.pkl')\r\njoblib.dump(X_test_mc_scaled, '../models/X_test_mc_scaled.pkl')\r\n\r\nprint(\"Scaler, label encoder, and data splits saved!\")\r\n
+===================================================================
+diff --git a/dataset/pre_processed.py b/dataset/pre_processed.py
+--- a/dataset/pre_processed.py	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/dataset/pre_processed.py	(date 1758537252916)
+@@ -1,9 +1,10 @@
+ # Step 4: Data Preprocessing and Feature Selection
+-import pandas as pd
++import joblib
+ import numpy as np
++import pandas as pd
+ from sklearn.model_selection import train_test_split
+ from sklearn.preprocessing import StandardScaler, LabelEncoder
+-import joblib
++
+ print("=== STEP 4: DATA PREPROCESSING ===")
+ # Load dataset CSV into df
+ df = pd.read_csv('rockfall_synthetic_dataset.csv')
+Index: models/train_models.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+># Step 5: Train Multiple ML Models\r\nfrom sklearn.ensemble import RandomForestClassifier\r\nfrom sklearn.linear_model import LogisticRegression\r\nfrom sklearn.neighbors import KNeighborsClassifier\r\nfrom sklearn.metrics import accuracy_score, roc_auc_score, classification_report\r\nimport joblib\r\n\r\nX_train = joblib.load('X_train.pkl')\r\nX_test = joblib.load('X_test.pkl')\r\ny_train_bin = joblib.load('y_train_bin.pkl')\r\ny_test_bin = joblib.load('y_test_bin.pkl')\r\nX_train_scaled = joblib.load('X_train_scaled.pkl')\r\nX_test_scaled = joblib.load('X_test_scaled.pkl')\r\n# ... similarly load for multiclass if needed ...\r\nX_train_mc = joblib.load('X_train_mc.pkl')\r\nX_test_mc = joblib.load('X_test_mc.pkl')\r\ny_train_mc = joblib.load('y_train_mc.pkl')\r\ny_test_mc = joblib.load('y_test_mc.pkl')\r\nX_train_mc_scaled = joblib.load('X_train_mc_scaled.pkl')\r\nX_test_mc_scaled = joblib.load('X_test_mc_scaled.pkl')\r\nprint(\"=== STEP 5: TRAINING MACHINE LEARNING MODELS ===\")\r\n\r\n# Initialize models based on research recommendations\r\nmodels = {\r\n    'Random Forest': RandomForestClassifier(random_state=42, n_estimators=100),\r\n    'Logistic Regression': LogisticRegression(random_state=42, max_iter=1000),\r\n    'K-Nearest Neighbors': KNeighborsClassifier(n_neighbors=7)  # Based on research finding k=7 optimal\r\n}\r\n\r\n# Train and evaluate binary classification models\r\nprint(\"\\n1. BINARY CLASSIFICATION (Rockfall/No Rockfall)\")\r\nprint(\"=\" * 50)\r\n\r\nbinary_results = {}\r\n\r\nfor name, model in models.items():\r\n    print(f\"\\nTraining {name}...\")\r\n\r\n    # Use scaled data for KNN and Logistic Regression, original for Random Forest\r\n    if name in ['K-Nearest Neighbors', 'Logistic Regression']:\r\n        model.fit(X_train_scaled, y_train_bin)\r\n        y_pred = model.predict(X_test_scaled)\r\n        y_pred_proba = model.predict_proba(X_test_scaled)[:, 1]\r\n    else:\r\n        model.fit(X_train, y_train_bin)\r\n        y_pred = model.predict(X_test)\r\n        y_pred_proba = model.predict_proba(X_test)[:, 1]\r\n\r\n    # Calculate metrics\r\n    accuracy = accuracy_score(y_test_bin, y_pred)\r\n\r\n    # Handle case where only one class is predicted\r\n    try:\r\n        auc = roc_auc_score(y_test_bin, y_pred_proba)\r\n    except:\r\n        auc = 0.5  # Default if AUC can't be calculated\r\n\r\n    binary_results[name] = {\r\n        'model': model,\r\n        'accuracy': accuracy,\r\n        'auc': auc,\r\n        'predictions': y_pred,\r\n        'probabilities': y_pred_proba\r\n    }\r\n\r\n    print(f\"Accuracy: {accuracy:.3f}\")\r\n    print(f\"AUC: {auc:.3f}\")\r\n\r\n# Find best binary model\r\nbest_binary_model_name = max(binary_results.keys(), key=lambda k: binary_results[k]['accuracy'])\r\nbest_binary_model = binary_results[best_binary_model_name]['model']\r\n\r\nprint(f\"\\nBest Binary Model: {best_binary_model_name}\")\r\nprint(f\"Best Binary Accuracy: {binary_results[best_binary_model_name]['accuracy']:.3f}\")\r\n\r\n# Train multiclass models\r\nprint(\"\\n2. MULTICLASS CLASSIFICATION (Low/Medium/High Risk)\")\r\nprint(\"=\" * 50)\r\n\r\nmulticlass_results = {}\r\n\r\nfor name, model in models.items():\r\n    print(f\"\\nTraining {name} for multiclass...\")\r\n\r\n    # Clone the model for multiclass\r\n    if name == 'Random Forest':\r\n        mc_model = RandomForestClassifier(random_state=42, n_estimators=100)\r\n    elif name == 'Logistic Regression':\r\n        mc_model = LogisticRegression(random_state=42, max_iter=1000, multi_class='ovr')\r\n    else:  # KNN\r\n        mc_model = KNeighborsClassifier(n_neighbors=7)\r\n\r\n    # Use appropriate data\r\n    if name in ['K-Nearest Neighbors', 'Logistic Regression']:\r\n        mc_model.fit(X_train_mc_scaled, y_train_mc)\r\n        y_pred_mc = mc_model.predict(X_test_mc_scaled)\r\n    else:\r\n        mc_model.fit(X_train_mc, y_train_mc)\r\n        y_pred_mc = mc_model.predict(X_test_mc)\r\n\r\n    accuracy_mc = accuracy_score(y_test_mc, y_pred_mc)\r\n\r\n    multiclass_results[name] = {\r\n        'model': mc_model,\r\n        'accuracy': accuracy_mc,\r\n        'predictions': y_pred_mc\r\n    }\r\n\r\n    print(f\"Multiclass Accuracy: {accuracy_mc:.3f}\")\r\n\r\n# Find best multiclass model\r\nbest_mc_model_name = max(multiclass_results.keys(), key=lambda k: multiclass_results[k]['accuracy'])\r\nbest_mc_model = multiclass_results[best_mc_model_name]['model']\r\n\r\nprint(f\"\\nBest Multiclass Model: {best_mc_model_name}\")\r\nprint(f\"Best Multiclass Accuracy: {multiclass_results[best_mc_model_name]['accuracy']:.3f}\")\r\n\r\nprint(\"\\nModel training complete!\")\r\n\r\njoblib.dump(best_binary_model, 'best_models/rockfall_binary_model.pkl')\r\njoblib.dump(best_mc_model, 'best_models/rockfall_multiclass_model.pkl')\r\n\r\nprint(\"Models saved successfully!\")
+===================================================================
+diff --git a/models/train_models.py b/models/train_models.py
+--- a/models/train_models.py	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/train_models.py	(date 1758537253004)
+@@ -1,9 +1,9 @@
+ # Step 5: Train Multiple ML Models
++import joblib
+ from sklearn.ensemble import RandomForestClassifier
+ from sklearn.linear_model import LogisticRegression
+-from sklearn.neighbors import KNeighborsClassifier
+ from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
+-import joblib
++from sklearn.neighbors import KNeighborsClassifier
+ 
+ X_train = joblib.load('X_train.pkl')
+ X_test = joblib.load('X_test.pkl')
+Index: models/model_tuning.py
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>import os\r\nimport pandas as pd\r\nfrom sklearn.ensemble import RandomForestClassifier\r\nfrom sklearn.model_selection import GridSearchCV, train_test_split\r\nfrom sklearn.metrics import accuracy_score, roc_auc_score, classification_report\r\nfrom sklearn.preprocessing import LabelEncoder\r\nimport joblib\r\n\r\nprint(\"=== STEP 6: HYPERPARAMETER TUNING FOR BINARY AND MULTICLASS ===\")\r\n\r\n# Paths\r\nproject_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))\r\ndataset_path = os.path.join(project_root, 'dataset', 'rockfall_synthetic_dataset.csv')\r\nmodels_dir = os.path.join(project_root, 'models')\r\nos.makedirs(models_dir, exist_ok=True)\r\n\r\n# Load dataset\r\ndf = pd.read_csv(dataset_path)\r\n\r\n# Feature columns\r\nfeature_columns = [\r\n    'slope_height_m', 'slope_angle_deg', 'cohesion_kpa', 'friction_angle_deg',\r\n    'unit_weight_kn_m3', 'rqd_percent', 'joint_spacing_m', 'rainfall_mm',\r\n    'temperature_range_c', 'groundwater_depth_m', 'freeze_thaw_cycles',\r\n    'blasting_distance_m', 'vibration_intensity', 'days_since_blast',\r\n    'mining_depth_m', 'days_since_rain', 'season_encoded',\r\n    'stability_index', 'weather_risk_score', 'operational_stress',\r\n    'geological_weakness', 'slope_steepness_factor'\r\n]\r\n\r\nX = df[feature_columns]\r\n\r\n# Prepare binary target\r\ny_binary = df['rockfall_binary']\r\n\r\n# Prepare multiclass target and encode\r\ny_multiclass = df['risk_level']\r\nle = LabelEncoder()\r\ny_multiclass_encoded = le.fit_transform(y_multiclass)\r\n\r\n# Split binary data\r\nX_train_bin, X_test_bin, y_train_bin, y_test_bin = train_test_split(\r\n    X, y_binary, test_size=0.3, random_state=42, stratify=y_binary\r\n)\r\n\r\n# Split multiclass data\r\nX_train_mc, X_test_mc, y_train_mc, y_test_mc = train_test_split(\r\n    X, y_multiclass_encoded, test_size=0.3, random_state=42, stratify=y_multiclass_encoded\r\n)\r\n\r\n# Hyperparameter grid\r\nrf_param_grid = {\r\n    'n_estimators': [100, 200, 300],\r\n    'max_depth': [10, 20, None],\r\n    'min_samples_split': [2, 7, 10],\r\n    'min_samples_leaf': [1, 2, 4]\r\n}\r\n\r\n# Function to tune and evaluate RF model\r\ndef tune_rf(X_train, y_train, X_test, y_test, task_name, scoring='accuracy', binary=False):\r\n    print(f\"\\nTuning Random Forest for {task_name}...\")\r\n    rf_grid = GridSearchCV(\r\n        RandomForestClassifier(random_state=42),\r\n        rf_param_grid,\r\n        cv=5,\r\n        scoring=scoring,\r\n        n_jobs=-1\r\n    )\r\n    rf_grid.fit(X_train, y_train)\r\n    print(f\"Best parameters for {task_name}: {rf_grid.best_params_}\")\r\n    print(f\"Best CV score for {task_name}: {rf_grid.best_score_:.3f}\")\r\n\r\n    best_model = rf_grid.best_estimator_\r\n    y_pred = best_model.predict(X_test)\r\n    accuracy = accuracy_score(y_test, y_pred)\r\n\r\n    print(f\"{task_name} Accuracy: {accuracy:.3f}\")\r\n\r\n    if binary:\r\n        try:\r\n            y_pred_proba = best_model.predict_proba(X_test)[:, 1]\r\n            auc = roc_auc_score(y_test, y_pred_proba)\r\n            print(f\"{task_name} AUC: {auc:.3f}\")\r\n        except Exception:\r\n            auc = 0.5\r\n            print(f\"{task_name} AUC could not be calculated, defaulting to 0.5\")\r\n        return best_model, accuracy, auc\r\n    else:\r\n        # Fix applied here: convert class names to strings explicitly\r\n        print(f\"{task_name} Classification Report:\\n{classification_report(y_test, y_pred, target_names=[str(c) for c in le.classes_])}\")\r\n        return best_model, accuracy\r\n\r\n# Tune binary model\r\nbest_rf_tuned_bin, bin_accuracy, bin_auc = tune_rf(X_train_bin, y_train_bin, X_test_bin, y_test_bin,\r\n                                                  'Binary Classification (Rockfall/No Rockfall)', binary=True)\r\n\r\n# Tune multiclass model\r\nbest_rf_tuned_mc, mc_accuracy = tune_rf(X_train_mc, y_train_mc, X_test_mc, y_test_mc,\r\n                                       'Multiclass Classification (Risk Levels)')\r\n\r\n# Save models and label encoder\r\njoblib.dump(best_rf_tuned_bin, os.path.join(models_dir, 'rockfall_binary_model.pkl'))\r\njoblib.dump(best_rf_tuned_mc, os.path.join(models_dir, 'rockfall_multiclass_model.pkl'))\r\njoblib.dump(le, os.path.join(models_dir, 'rockfall_label_encoder.pkl'))\r\n\r\nprint(\"\\nBest models and label encoder saved successfully.\")\r\n\r\n# Feature importance from multiclass tuned model\r\nfeature_importance = pd.DataFrame({\r\n    'feature': feature_columns,\r\n    'importance': best_rf_tuned_mc.feature_importances_\r\n}).sort_values('importance', ascending=False)\r\n\r\nprint(f\"\\nTop 10 Most Important Features (Multiclass Model):\")\r\nfor i, row in feature_importance.head(10).iterrows():\r\n    print(f\"  {row['feature']}: {row['importance']:.3f}\")\r\n\r\nfeature_importance.to_csv(os.path.join(models_dir, 'feature_importance.csv'), index=False)\r\nprint(f\"\\nFeature importance saved to '{os.path.join(models_dir, 'feature_importance.csv')}'\")\r\n
+===================================================================
+diff --git a/models/model_tuning.py b/models/model_tuning.py
+--- a/models/model_tuning.py	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/model_tuning.py	(date 1758542816582)
+@@ -1,10 +1,11 @@
+ import os
++
++import joblib
+ import pandas as pd
+ from sklearn.ensemble import RandomForestClassifier
+-from sklearn.model_selection import GridSearchCV, train_test_split
+ from sklearn.metrics import accuracy_score, roc_auc_score, classification_report
++from sklearn.model_selection import GridSearchCV, train_test_split
+ from sklearn.preprocessing import LabelEncoder
+-import joblib
+ 
+ print("=== STEP 6: HYPERPARAMETER TUNING FOR BINARY AND MULTICLASS ===")
+ 
+@@ -52,8 +53,8 @@
+ rf_param_grid = {
+     'n_estimators': [100, 200, 300],
+     'max_depth': [10, 20, None],
+-    'min_samples_split': [2, 7, 10],
+-    'min_samples_leaf': [1, 2, 4]
++    'min_samples_split': [2, 8, 10],
++    'min_samples_leaf': [1, 3, 4]
+ }
+ 
+ # Function to tune and evaluate RF model
+Index: models/static/js/dashboard.js
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>class RockfallDashboard {\r\n    constructor() {\r\n        this.isConnected = false;\r\n        this.zoneMap = [\"Zone_A\", \"Zone_B\", \"Zone_C\"];\r\n        this.updateZoneStatus = {\r\n            \"Zone_A\": \"safe\",\r\n            \"Zone_B\": \"safe\",\r\n            \"Zone_C\": \"safe\"\r\n        };\r\n        this.updateZoneLastNotified = {};\r\n        this.updateNotificationCooldown = 60000; // 1 min per zone\r\n        this.updateInterval = 5000; // 5 seconds\r\n        this.charts = {};\r\n        this.lastUpdate = null;\r\n        this.init();\r\n    }\r\n\r\n    init() {\r\n        console.log('Initializing Rockfall Dashboard...');\r\n        this.setupCharts();\r\n        this.startDataFetching();\r\n        this.hideLoadingOverlay();\r\n\r\n        // Notification API permission\r\n        if (window.Notification && Notification.permission !== \"granted\") {\r\n            Notification.requestPermission();\r\n        }\r\n        this.renderZones();\r\n    }\r\n\r\n    renderZones() {\r\n        const zoneBar = document.getElementById('zone-status-bar');\r\n        if (!zoneBar) return;\r\n        zoneBar.innerHTML = \"\";\r\n        this.zoneMap.forEach(zone => {\r\n            const status = this.updateZoneStatus[zone];\r\n            const colorClass =\r\n                status === \"safe\" ? \"zone-block zone-safe\" :\r\n                status === \"medium\" ? \"zone-block zone-medium\" :\r\n                \"zone-block zone-danger\";\r\n            let statusText =\r\n                status === \"safe\" ? \"SAFE\" :\r\n                status === \"medium\" ? \"MONITOR\" :\r\n                \"BLOCKED\";\r\n            const div = document.createElement('div');\r\n            div.className = colorClass;\r\n            div.innerHTML = `${zone}: <span>${statusText}</span>`;\r\n            zoneBar.appendChild(div);\r\n        });\r\n    }\r\n\r\n    assignZoneAndNotify(riskLevel) {\r\n        // For demonstration: rotate active zone with every update. In production,\r\n        // map risk to zone from backend's data field or business logic.\r\n        const nowIdx = Math.floor(Date.now() / this.updateInterval) % this.zoneMap.length;\r\n        const activeZone = this.zoneMap[nowIdx];\r\n\r\n        let zoneStatus = \"safe\";\r\n        if (riskLevel === \"medium\") zoneStatus = \"medium\";\r\n        if (riskLevel === \"high\" || riskLevel === \"critical\") zoneStatus = \"danger\";\r\n        this.zoneMap.forEach(zone => {\r\n            this.updateZoneStatus[zone] = (zone === activeZone) ? zoneStatus : \"safe\";\r\n        });\r\n        this.renderZones();\r\n        if (zoneStatus === \"danger\") this.checkAndNotifyRisk(activeZone, riskLevel);\r\n    }\r\n\r\n    checkAndNotifyRisk(zoneKey, riskLevel) {\r\n        const now = Date.now();\r\n        if (!this.updateZoneLastNotified[zoneKey] ||\r\n            now - this.updateZoneLastNotified[zoneKey] > this.updateNotificationCooldown) {\r\n            this.sendNotification(\"Rockfall Danger Zone!\", {\r\n                body: `Work in ${zoneKey} BLOCKED. High rockfall risk, stop work.`,\r\n                icon: \"/static/alert-icon.png\"\r\n            });\r\n            this.updateZoneLastNotified[zoneKey] = now;\r\n            console.log(`Work in ${zoneKey} is blocked.`);\r\n        }\r\n    }\r\n\r\n    sendNotification(title, options) {\r\n        if (window.Notification && Notification.permission === \"granted\") {\r\n            new Notification(title, options);\r\n        } else {\r\n            console.log(\"Notification:\", title, options.body);\r\n        }\r\n    }\r\n\r\n    updatePredictionDisplay(data) {\r\n        const binary = data.binary_result;\r\n        const riskLevel = binary.risk_level.toLowerCase();\r\n\r\n        // UI - update main risk displays\r\n        const riskLevelElem = document.getElementById(\"risk-level\");\r\n        const riskCircle = document.getElementById(\"risk-circle\");\r\n        const confidenceBar = document.getElementById(\"confidence-bar\");\r\n        const confidenceText = document.getElementById(\"confidence-text\");\r\n        const recommendation = document.getElementById(\"recommendation\");\r\n\r\n        if (riskLevelElem) riskLevelElem.textContent = binary.risk_level;\r\n        if (riskCircle) riskCircle.className = \"risk-circle \" + riskLevel;\r\n        if (confidenceBar && confidenceText) {\r\n            const confPercent = binary.confidence * 100;\r\n            confidenceBar.style.width = confPercent + \"%\";\r\n            confidenceText.textContent = confPercent.toFixed(1) + \"%\";\r\n            confidenceBar.className = \"progress-bar \" + this.getRiskColorClass(binary.risk_level);\r\n        }\r\n        if (recommendation) recommendation.textContent = binary.recommendation;\r\n\r\n        // Assign risk and update zone bar & notifications\r\n        this.assignZoneAndNotify(riskLevel);\r\n\r\n        // Optionally, show alert if required\r\n        if (binary.confidence > 0.6)\r\n            this.showAlert(binary.risk_level, binary.recommendation, binary.risk_level);\r\n    }\r\n\r\n    getRiskColorClass(riskLevel) {\r\n        switch (riskLevel.toLowerCase()) {\r\n            case 'low': return 'bg-success';\r\n            case 'medium': return 'bg-warning';\r\n            case 'high': return 'bg-danger';\r\n            case 'critical': return 'bg-danger';\r\n            default: return 'bg-secondary';\r\n        }\r\n    }\r\n\r\n    // --- STANDARD DASHBOARD LOGIC ---\r\n\r\n    hideLoadingOverlay() {\r\n        const overlay = document.getElementById('loading-overlay');\r\n        if (overlay) {\r\n            overlay.style.opacity = '0';\r\n            setTimeout(() => overlay.style.display = 'none', 150);\r\n        }\r\n    }\r\n\r\n    setupCharts() {\r\n        const riskCtx = document.getElementById('riskChart').getContext('2d');\r\n        this.charts.risk = new Chart(riskCtx, {\r\n            type: 'line',\r\n            data: {\r\n                labels: [],\r\n                datasets: [{\r\n                    label: 'Risk Confidence',\r\n                    data: [],\r\n                    borderColor: '#dc3545',\r\n                    backgroundColor: 'rgba(220, 53, 69, 0.1)',\r\n                    tension: 0.4,\r\n                    fill: true\r\n                }]\r\n            },\r\n            options: {\r\n                responsive: true,\r\n                maintainAspectRatio: false,\r\n                scales: {\r\n                    y: {\r\n                        beginAtZero: true,\r\n                        max: 1,\r\n                        ticks: {\r\n                            callback: value => (value * 100).toFixed(0) + '%'\r\n                        }\r\n                    },\r\n                    x: {\r\n                        type: 'time',\r\n                        time: {\r\n                            displayFormats: {\r\n                                minute: 'HH:mm'\r\n                            }\r\n                        }\r\n                    }\r\n                },\r\n                plugins: {\r\n                    legend: { display: true },\r\n                    title: { display: true, text: 'Risk Confidence Over Time' }\r\n                }\r\n            }\r\n        });\r\n\r\n        const sensorCtx = document.getElementById('sensorChart').getContext('2d');\r\n        this.charts.sensor = new Chart(sensorCtx, {\r\n            type: 'line',\r\n            data: {\r\n                labels: [],\r\n                datasets: [\r\n                    { label: 'Slope Height (m)', data: [], borderColor: '#007bff', backgroundColor: 'rgba(0,123,255,0.1)', yAxisID: 'y' },\r\n                    { label: 'Rainfall (mm)', data: [], borderColor: '#28a745', backgroundColor: 'rgba(40,167,69,0.1)', yAxisID: 'y1' },\r\n                    { label: 'Vibration Intensity', data: [], borderColor: '#ffc107', backgroundColor: 'rgba(255,193,7,0.1)', yAxisID: 'y2' },\r\n                    { label: 'RQD (%)', data: [], borderColor: '#6f42c1', backgroundColor: 'rgba(111,66,193,0.1)', yAxisID: 'y3' }\r\n                ]\r\n            },\r\n            options: {\r\n                responsive: true,\r\n                maintainAspectRatio: false,\r\n                interaction: { mode: 'index', intersect: false },\r\n                scales: {\r\n                    x: { type: 'time', time: { displayFormats: { minute: 'HH:mm' }}},\r\n                    y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Height (m)' }},\r\n                    y1: { type: 'linear', display: false, position: 'right' },\r\n                    y2: { type: 'linear', display: false, position: 'right' },\r\n                    y3: { type: 'linear', display: false, position: 'right' }\r\n                },\r\n                plugins: {\r\n                    legend: { display: true, position: 'top' },\r\n                    title: { display: true, text: 'Key Sensor Parameters' }\r\n                }\r\n            }\r\n        });\r\n    }\r\n\r\n    async fetchSensorData() {\r\n        try {\r\n            const response = await fetch('/api/sensor-data');\r\n            if (!response.ok) throw new Error('Failed to fetch sensor data');\r\n            const data = await response.json();\r\n            this.updateSensorDisplay(data);\r\n            this.setConnectionStatus(true);\r\n            this.fetchPrediction();\r\n        } catch (error) {\r\n            console.error('Error fetching sensor data:', error);\r\n            this.setConnectionStatus(false);\r\n        }\r\n    }\r\n\r\n    async fetchPrediction() {\r\n        try {\r\n            const response = await fetch('/api/predict');\r\n            if (!response.ok) throw new Error('Failed to fetch prediction');\r\n            const data = await response.json();\r\n            this.updatePredictionDisplay(data);\r\n        } catch (error) {\r\n            console.error('Error fetching prediction:', error);\r\n        }\r\n    }\r\n\r\n    async fetchHistory() {\r\n        try {\r\n            const response = await fetch('/api/history');\r\n            if (!response.ok) throw new Error('Failed to fetch history');\r\n            const data = await response.json();\r\n            this.updateCharts(data);\r\n            this.updatePredictionsTable(data.prediction_history);\r\n        } catch (error) {\r\n            console.error('Error fetching history:', error);\r\n        }\r\n    }\r\n\r\n    updateSensorDisplay(data) {\r\n        const sensorElements = {\r\n            'slope-height': data.slope_height_m?.toFixed(1) + ' m',\r\n            'slope-angle': data.slope_angle_deg?.toFixed(1) + ' °',\r\n            'rainfall': data.rainfall_mm?.toFixed(1) + ' mm',\r\n            'vibration': data.vibration_intensity?.toFixed(2),\r\n            'cohesion': data.cohesion_kpa?.toFixed(1) + ' kPa',\r\n            'temperature': data.temperature_range_c?.toFixed(1) + ' °C',\r\n            'groundwater': data.groundwater_depth_m?.toFixed(1) + ' m',\r\n            'rqd': data.rqd_percent?.toFixed(1) + ' %'\r\n        };\r\n        Object.entries(sensorElements).forEach(([id, value]) => {\r\n            const element = document.getElementById(id);\r\n            if (element) {\r\n                element.textContent = value;\r\n                element.classList.add('updated');\r\n                setTimeout(() => element.classList.remove('updated'), 500);\r\n            }\r\n        });\r\n        this.lastUpdate = new Date();\r\n        this.updateLastUpdateTime();\r\n    }\r\n\r\n    showAlert(title, message, level) {\r\n        const alertBanner = document.getElementById('alert-banner');\r\n        const alertTitle = document.getElementById('alert-title');\r\n        const alertMessage = document.getElementById('alert-message');\r\n        if (alertBanner && alertTitle && alertMessage) {\r\n            alertTitle.textContent = title + ' RISK DETECTED';\r\n            alertMessage.textContent = message;\r\n            alertBanner.className = `alert alert-dismissible fade show alert-${level.toLowerCase() === 'critical' ? 'danger' : 'warning'}`;\r\n            alertBanner.style.display = 'block';\r\n            setTimeout(() => {\r\n                alertBanner.classList.remove('show');\r\n                setTimeout(() => alertBanner.style.display = 'none', 300);\r\n            }, 10000);\r\n        }\r\n    }\r\n\r\n    setConnectionStatus(connected) {\r\n        this.isConnected = connected;\r\n        const statusElement = document.getElementById('connection-status');\r\n        if (statusElement) {\r\n            statusElement.textContent = connected ? 'Connected' : 'Disconnected';\r\n            statusElement.className = `badge me-2 ${connected ? 'bg-success' : 'bg-danger'}`;\r\n        }\r\n    }\r\n\r\n    updateLastUpdateTime() {\r\n        const lastUpdateElement = document.getElementById('last-update');\r\n        if (lastUpdateElement && this.lastUpdate) {\r\n            lastUpdateElement.textContent = `Last update: ${this.lastUpdate.toLocaleTimeString()}`;\r\n        }\r\n    }\r\n\r\n    updateCharts(data) {\r\n        if (data.prediction_history?.length > 0) {\r\n            const riskLabels = data.prediction_history.map(item => new Date(item.timestamp));\r\n            const riskData = data.prediction_history.map(item => item.confidence);\r\n            this.charts.risk.data.labels = riskLabels;\r\n            this.charts.risk.data.datasets[0].data = riskData;\r\n            this.charts.risk.update('none');\r\n        }\r\n        if (data.sensor_history?.length > 0) {\r\n            const sensorLabels = data.sensor_history.map(item => new Date(item.timestamp));\r\n            this.charts.sensor.data.labels = sensorLabels;\r\n            this.charts.sensor.data.datasets[0].data = data.sensor_history.map(item => item.slope_height_m);\r\n            this.charts.sensor.data.datasets[1].data = data.sensor_history.map(item => item.rainfall_mm);\r\n            this.charts.sensor.data.datasets[2].data = data.sensor_history.map(item => item.vibration_intensity);\r\n            this.charts.sensor.data.datasets[3].data = data.sensor_history.map(item => item.rqd_percent);\r\n            this.charts.sensor.update('none');\r\n        }\r\n    }\r\n\r\n    updatePredictionsTable(predictions) {\r\n        const tbody = document.getElementById('predictions-table');\r\n        if (!tbody || !predictions || predictions.length === 0) return;\r\n        tbody.innerHTML = '';\r\n        const recentPredictions = predictions.slice(-10).reverse();\r\n        recentPredictions.forEach(pred => {\r\n            const row = document.createElement('tr');\r\n            const timestamp = new Date(pred.timestamp).toLocaleString();\r\n            const riskBadge = `<span class=\"badge ${this.getRiskColorClass(pred.risk_level)}\">${pred.risk_level}</span>`;\r\n            const confidence = `${(pred.confidence * 100).toFixed(1)}%`;\r\n            const classification = pred.prediction_label || 'N/A';\r\n            row.innerHTML = `\r\n                <td>${timestamp}</td>\r\n                <td>${riskBadge}</td>\r\n                <td>${confidence}</td>\r\n                <td>${classification}</td>\r\n                <td><small class=\"text-muted\">Slope conditions analyzed</small></td>\r\n            `;\r\n            tbody.appendChild(row);\r\n        });\r\n    }\r\n\r\n    startDataFetching() {\r\n        this.fetchSensorData();\r\n        this.fetchHistory();\r\n        setInterval(() => {\r\n            this.fetchSensorData();\r\n            this.fetchHistory();\r\n        }, this.updateInterval);\r\n        console.log(`Started data fetching with ${this.updateInterval}ms interval`);\r\n    }\r\n}\r\n\r\ndocument.addEventListener('DOMContentLoaded', () => {\r\n    window.dashboard = new RockfallDashboard();\r\n});\r\n\r\ndocument.addEventListener('visibilitychange', () => {\r\n    if (!document.hidden && window.dashboard) {\r\n        window.dashboard.fetchSensorData();\r\n        window.dashboard.fetchHistory();\r\n    }\r\n});\r\n
+===================================================================
+diff --git a/models/static/js/dashboard.js b/models/static/js/dashboard.js
+--- a/models/static/js/dashboard.js	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/static/js/dashboard.js	(date 1758542395807)
+@@ -1,364 +1,477 @@
+ class RockfallDashboard {
+-    constructor() {
+-        this.isConnected = false;
+-        this.zoneMap = ["Zone_A", "Zone_B", "Zone_C"];
+-        this.updateZoneStatus = {
+-            "Zone_A": "safe",
+-            "Zone_B": "safe",
+-            "Zone_C": "safe"
+-        };
+-        this.updateZoneLastNotified = {};
+-        this.updateNotificationCooldown = 60000; // 1 min per zone
+-        this.updateInterval = 5000; // 5 seconds
+-        this.charts = {};
+-        this.lastUpdate = null;
+-        this.init();
+-    }
++  constructor() {
++    this.isConnected = false;
++    this.zoneMap = ["Zone_A", "Zone_B", "Zone_C"];
++    this.updateZoneStatus = {
++      Zone_A: "safe",
++      Zone_B: "safe",
++      Zone_C: "safe",
++    };
++    this.updateZoneLastNotified = {};
++    this.updateNotificationCooldown = 60000; // 1 min per zone
++    this.updateInterval = 5000; // 5 seconds
++    this.charts = {};
++    this.lastUpdate = null;
++    this.init();
++  }
+ 
+-    init() {
+-        console.log('Initializing Rockfall Dashboard...');
+-        this.setupCharts();
+-        this.startDataFetching();
+-        this.hideLoadingOverlay();
++  init() {
++    console.log("Initializing Rockfall Dashboard...");
++    this.setupCharts();
++    this.startDataFetching();
++    this.hideLoadingOverlay();
+ 
+-        // Notification API permission
+-        if (window.Notification && Notification.permission !== "granted") {
+-            Notification.requestPermission();
+-        }
+-        this.renderZones();
+-    }
++    // Notification API permission
++    if (window.Notification && Notification.permission !== "granted") {
++      Notification.requestPermission();
++    }
++    this.renderZones();
++
++    // Accessibility announcements for dynamic content can be added here
++  }
+ 
+-    renderZones() {
+-        const zoneBar = document.getElementById('zone-status-bar');
+-        if (!zoneBar) return;
+-        zoneBar.innerHTML = "";
+-        this.zoneMap.forEach(zone => {
+-            const status = this.updateZoneStatus[zone];
+-            const colorClass =
+-                status === "safe" ? "zone-block zone-safe" :
+-                status === "medium" ? "zone-block zone-medium" :
+-                "zone-block zone-danger";
+-            let statusText =
+-                status === "safe" ? "SAFE" :
+-                status === "medium" ? "MONITOR" :
+-                "BLOCKED";
+-            const div = document.createElement('div');
+-            div.className = colorClass;
+-            div.innerHTML = `${zone}: <span>${statusText}</span>`;
+-            zoneBar.appendChild(div);
+-        });
+-    }
++  renderZones() {
++    const zoneBar = document.getElementById("zone-status-bar");
++    if (!zoneBar) return;
++    zoneBar.innerHTML = "";
++    this.zoneMap.forEach((zone) => {
++      const status = this.updateZoneStatus[zone];
++      const colorClass =
++        status === "safe"
++          ? "zone-block zone-safe"
++          : status === "medium"
++          ? "zone-block zone-medium"
++          : "zone-block zone-danger";
++      let statusText =
++        status === "safe" ? "SAFE" : status === "medium" ? "MONITOR" : "BLOCKED";
++      const div = document.createElement("div");
++      div.className = colorClass;
++      div.setAttribute("tabindex", "0");
++      div.setAttribute("role", "region");
++      div.setAttribute("aria-live", "polite");
++      div.setAttribute("aria-label", `${zone} status: ${statusText}`);
++      div.innerHTML = `${zone}: <span>${statusText}</span>`;
++      zoneBar.appendChild(div);
++    });
++  }
+ 
+-    assignZoneAndNotify(riskLevel) {
+-        // For demonstration: rotate active zone with every update. In production,
+-        // map risk to zone from backend's data field or business logic.
+-        const nowIdx = Math.floor(Date.now() / this.updateInterval) % this.zoneMap.length;
+-        const activeZone = this.zoneMap[nowIdx];
++  assignZoneAndNotify(riskLevel) {
++    // For demonstration: rotate active zone with every update. In production,
++    // map risk to zone from backend's data field or business logic.
++    const nowIdx = Math.floor(Date.now() / this.updateInterval) % this.zoneMap.length;
++    const activeZone = this.zoneMap[nowIdx];
+ 
+-        let zoneStatus = "safe";
+-        if (riskLevel === "medium") zoneStatus = "medium";
+-        if (riskLevel === "high" || riskLevel === "critical") zoneStatus = "danger";
+-        this.zoneMap.forEach(zone => {
+-            this.updateZoneStatus[zone] = (zone === activeZone) ? zoneStatus : "safe";
+-        });
+-        this.renderZones();
+-        if (zoneStatus === "danger") this.checkAndNotifyRisk(activeZone, riskLevel);
+-    }
++    let zoneStatus = "safe";
++    if (riskLevel === "medium") zoneStatus = "medium";
++    if (riskLevel === "high" || riskLevel === "critical") zoneStatus = "danger";
++    this.zoneMap.forEach((zone) => {
++      this.updateZoneStatus[zone] = zone === activeZone ? zoneStatus : "safe";
++    });
++    this.renderZones();
++    if (zoneStatus === "danger") this.checkAndNotifyRisk(activeZone, riskLevel);
++  }
+ 
+-    checkAndNotifyRisk(zoneKey, riskLevel) {
+-        const now = Date.now();
+-        if (!this.updateZoneLastNotified[zoneKey] ||
+-            now - this.updateZoneLastNotified[zoneKey] > this.updateNotificationCooldown) {
+-            this.sendNotification("Rockfall Danger Zone!", {
+-                body: `Work in ${zoneKey} BLOCKED. High rockfall risk, stop work.`,
+-                icon: "/static/alert-icon.png"
+-            });
+-            this.updateZoneLastNotified[zoneKey] = now;
+-            console.log(`Work in ${zoneKey} is blocked.`);
+-        }
+-    }
++  checkAndNotifyRisk(zoneKey, riskLevel) {
++    const now = Date.now();
++    if (
++      !this.updateZoneLastNotified[zoneKey] ||
++      now - this.updateZoneLastNotified[zoneKey] > this.updateNotificationCooldown
++    ) {
++      this.sendNotification("Rockfall Danger Zone!", {
++        body: `Work in ${zoneKey} BLOCKED. High rockfall risk, stop work.`,
++        icon: "/static/alert-icon.png",
++      });
++      this.updateZoneLastNotified[zoneKey] = now;
++      console.log(`Work in ${zoneKey} is blocked.`);
++    }
++  }
+ 
+-    sendNotification(title, options) {
+-        if (window.Notification && Notification.permission === "granted") {
+-            new Notification(title, options);
+-        } else {
+-            console.log("Notification:", title, options.body);
+-        }
+-    }
++  sendNotification(title, options) {
++    if (window.Notification && Notification.permission === "granted") {
++      new Notification(title, options);
++    } else {
++      console.log("Notification:", title, options.body);
++    }
++  }
+ 
+-    updatePredictionDisplay(data) {
+-        const binary = data.binary_result;
+-        const riskLevel = binary.risk_level.toLowerCase();
++  updatePredictionDisplay(data) {
++    const binary = data.binary_result;
++    const riskLevel = binary.risk_level.toLowerCase();
+ 
+-        // UI - update main risk displays
+-        const riskLevelElem = document.getElementById("risk-level");
+-        const riskCircle = document.getElementById("risk-circle");
+-        const confidenceBar = document.getElementById("confidence-bar");
+-        const confidenceText = document.getElementById("confidence-text");
+-        const recommendation = document.getElementById("recommendation");
++    // UI - update main risk displays
++    const riskLevelElem = document.getElementById("risk-level");
++    const riskCircle = document.getElementById("risk-circle");
++    const confidenceBar = document.getElementById("confidence-bar");
++    const confidenceText = document.getElementById("confidence-text");
++    const recommendation = document.getElementById("recommendation");
+ 
+-        if (riskLevelElem) riskLevelElem.textContent = binary.risk_level;
+-        if (riskCircle) riskCircle.className = "risk-circle " + riskLevel;
+-        if (confidenceBar && confidenceText) {
+-            const confPercent = binary.confidence * 100;
+-            confidenceBar.style.width = confPercent + "%";
+-            confidenceText.textContent = confPercent.toFixed(1) + "%";
+-            confidenceBar.className = "progress-bar " + this.getRiskColorClass(binary.risk_level);
+-        }
+-        if (recommendation) recommendation.textContent = binary.recommendation;
++    if (riskLevelElem) riskLevelElem.textContent = binary.risk_level;
++    if (riskCircle) {
++      // Reset classes and add new risk class with animation
++      riskCircle.className = "risk-circle " + riskLevel;
++      riskCircle.setAttribute("aria-label", `Current risk level is ${binary.risk_level}`);
++    }
++    if (confidenceBar && confidenceText) {
++      const confPercent = binary.confidence * 100;
++      confidenceBar.style.width = confPercent + "%";
++      confidenceText.textContent = confPercent.toFixed(1) + "%";
++      confidenceBar.className =
++        "progress-bar " + this.getRiskColorClass(binary.risk_level);
++      confidenceBar.setAttribute("aria-valuenow", confPercent.toFixed(1));
++    }
++    if (recommendation) {
++      recommendation.textContent = binary.recommendation;
++      recommendation.setAttribute("aria-label", `Recommendation: ${binary.recommendation}`);
++    }
+ 
+-        // Assign risk and update zone bar & notifications
+-        this.assignZoneAndNotify(riskLevel);
++    // Assign risk and update zone bar & notifications
++    this.assignZoneAndNotify(riskLevel);
+ 
+-        // Optionally, show alert if required
+-        if (binary.confidence > 0.6)
+-            this.showAlert(binary.risk_level, binary.recommendation, binary.risk_level);
+-    }
++    // Show alert banner if confidence high
++    if (binary.confidence > 0.6)
++      this.showAlert(binary.risk_level, binary.recommendation, binary.risk_level);
++  }
+ 
+-    getRiskColorClass(riskLevel) {
+-        switch (riskLevel.toLowerCase()) {
+-            case 'low': return 'bg-success';
+-            case 'medium': return 'bg-warning';
+-            case 'high': return 'bg-danger';
+-            case 'critical': return 'bg-danger';
+-            default: return 'bg-secondary';
+-        }
+-    }
++  getRiskColorClass(riskLevel) {
++    switch (riskLevel.toLowerCase()) {
++      case "low":
++        return "bg-success";
++      case "medium":
++        return "bg-warning";
++      case "high":
++        return "bg-danger";
++      case "critical":
++        return "bg-danger";
++      default:
++        return "bg-secondary";
++    }
++  }
+ 
+-    // --- STANDARD DASHBOARD LOGIC ---
++  // --- STANDARD DASHBOARD LOGIC ---
+ 
+-    hideLoadingOverlay() {
+-        const overlay = document.getElementById('loading-overlay');
+-        if (overlay) {
+-            overlay.style.opacity = '0';
+-            setTimeout(() => overlay.style.display = 'none', 150);
+-        }
+-    }
++  hideLoadingOverlay() {
++    const overlay = document.getElementById("loading-overlay");
++    if (overlay) {
++      overlay.setAttribute("aria-hidden", "true");
++      overlay.style.opacity = "0";
++      setTimeout(() => (overlay.style.display = "none"), 300);
++    }
++  }
+ 
+-    setupCharts() {
+-        const riskCtx = document.getElementById('riskChart').getContext('2d');
+-        this.charts.risk = new Chart(riskCtx, {
+-            type: 'line',
+-            data: {
+-                labels: [],
+-                datasets: [{
+-                    label: 'Risk Confidence',
+-                    data: [],
+-                    borderColor: '#dc3545',
+-                    backgroundColor: 'rgba(220, 53, 69, 0.1)',
+-                    tension: 0.4,
+-                    fill: true
+-                }]
+-            },
+-            options: {
+-                responsive: true,
+-                maintainAspectRatio: false,
+-                scales: {
+-                    y: {
+-                        beginAtZero: true,
+-                        max: 1,
+-                        ticks: {
+-                            callback: value => (value * 100).toFixed(0) + '%'
+-                        }
+-                    },
+-                    x: {
+-                        type: 'time',
+-                        time: {
+-                            displayFormats: {
+-                                minute: 'HH:mm'
+-                            }
+-                        }
+-                    }
+-                },
+-                plugins: {
+-                    legend: { display: true },
+-                    title: { display: true, text: 'Risk Confidence Over Time' }
+-                }
+-            }
+-        });
++  setupCharts() {
++    const riskCtx = document.getElementById("riskChart").getContext("2d");
++    this.charts.risk = new Chart(riskCtx, {
++      type: "line",
++      data: {
++        labels: [],
++        datasets: [
++          {
++            label: "Risk Confidence",
++            data: [],
++            borderColor: "#dc3545",
++            backgroundColor: "rgba(220, 53, 69, 0.15)",
++            tension: 0.4,
++            fill: true,
++            pointRadius: 2,
++            pointHoverRadius: 5,
++            borderWidth: 2,
++          },
++        ],
++      },
++      options: {
++        responsive: true,
++        maintainAspectRatio: false,
++        interaction: { mode: "nearest", intersect: false },
++        scales: {
++          y: {
++            beginAtZero: true,
++            max: 1,
++            ticks: {
++              callback: (value) => (value * 100).toFixed(0) + "%",
++            },
++            grid: {
++              drawBorder: false,
++              color: "#f0f0f0",
++            },
++          },
++          x: {
++            type: "time",
++            time: {
++              unit: "minute",
++              displayFormats: { minute: "HH:mm" },
++            },
++            grid: {
++              drawBorder: false,
++              color: "#f0f0f0",
++            },
++          },
++        },
++        plugins: {
++          legend: { display: true, position: "top" },
++          title: { display: true, text: "Risk Confidence Over Time", font: { size: 16 } },
++          tooltip: {
++            enabled: true,
++            mode: "nearest",
++            intersect: false,
++            callbacks: {
++              label: (context) => {
++                return (
++                  context.dataset.label + ": " + (context.parsed.y * 100).toFixed(2) + "%"
++                );
++              },
++            },
++          },
++        },
++      },
++    });
+ 
+-        const sensorCtx = document.getElementById('sensorChart').getContext('2d');
+-        this.charts.sensor = new Chart(sensorCtx, {
+-            type: 'line',
+-            data: {
+-                labels: [],
+-                datasets: [
+-                    { label: 'Slope Height (m)', data: [], borderColor: '#007bff', backgroundColor: 'rgba(0,123,255,0.1)', yAxisID: 'y' },
+-                    { label: 'Rainfall (mm)', data: [], borderColor: '#28a745', backgroundColor: 'rgba(40,167,69,0.1)', yAxisID: 'y1' },
+-                    { label: 'Vibration Intensity', data: [], borderColor: '#ffc107', backgroundColor: 'rgba(255,193,7,0.1)', yAxisID: 'y2' },
+-                    { label: 'RQD (%)', data: [], borderColor: '#6f42c1', backgroundColor: 'rgba(111,66,193,0.1)', yAxisID: 'y3' }
+-                ]
+-            },
+-            options: {
+-                responsive: true,
+-                maintainAspectRatio: false,
+-                interaction: { mode: 'index', intersect: false },
+-                scales: {
+-                    x: { type: 'time', time: { displayFormats: { minute: 'HH:mm' }}},
+-                    y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Height (m)' }},
+-                    y1: { type: 'linear', display: false, position: 'right' },
+-                    y2: { type: 'linear', display: false, position: 'right' },
+-                    y3: { type: 'linear', display: false, position: 'right' }
+-                },
+-                plugins: {
+-                    legend: { display: true, position: 'top' },
+-                    title: { display: true, text: 'Key Sensor Parameters' }
+-                }
+-            }
+-        });
+-    }
++    const sensorCtx = document.getElementById("sensorChart").getContext("2d");
++    this.charts.sensor = new Chart(sensorCtx, {
++      type: "line",
++      data: {
++        labels: [],
++        datasets: [
++          {
++            label: "Slope Height (m)",
++            data: [],
++            borderColor: "#007bff",
++            backgroundColor: "rgba(0,123,255,0.2)",
++            yAxisID: "y",
++            pointRadius: 2,
++            pointHoverRadius: 5,
++            borderWidth: 2,
++          },
++          {
++            label: "Rainfall (mm)",
++            data: [],
++            borderColor: "#28a745",
++            backgroundColor: "rgba(40,167,69,0.2)",
++            yAxisID: "y1",
++            pointRadius: 2,
++            pointHoverRadius: 5,
++            borderWidth: 2,
++          },
++          {
++            label: "Vibration Intensity",
++            data: [],
++            borderColor: "#ffc107",
++            backgroundColor: "rgba(255,193,7,0.2)",
++            yAxisID: "y2",
++            pointRadius: 2,
++            pointHoverRadius: 5,
++            borderWidth: 2,
++          },
++          {
++            label: "RQD (%)",
++            data: [],
++            borderColor: "#6f42c1",
++            backgroundColor: "rgba(111,66,193,0.2)",
++            yAxisID: "y3",
++            pointRadius: 2,
++            pointHoverRadius: 5,
++            borderWidth: 2,
++          },
++        ],
++      },
++      options: {
++        responsive: true,
++        maintainAspectRatio: false,
++        interaction: { mode: "index", intersect: false },
++        scales: {
++          x: { type: "time", time: { unit: "minute", displayFormats: { minute: "HH:mm" } } },
++          y: {
++            type: "linear",
++            display: true,
++            position: "left",
++            title: { display: true, text: "Height (m)" },
++            grid: { drawBorder: false },
++          },
++          y1: {
++            type: "linear",
++            display: false,
++            position: "right",
++            grid: { drawOnChartArea: false },
++          },
++          y2: {
++            type: "linear",
++            display: false,
++            position: "right",
++            grid: { drawOnChartArea: false },
++          },
++          y3: {
++            type: "linear",
++            display: false,
++            position: "right",
++            grid: { drawOnChartArea: false },
++          },
++        },
++        plugins: {
++          legend: { display: true, position: "top", labels: { boxWidth: 12, padding: 10 } },
++          title: { display: true, text: "Key Sensor Parameters", font: { size: 16 } },
++          tooltip: {
++            enabled: true,
++            mode: "nearest",
++            intersect: false,
++          },
++        },
++      },
++    });
++  }
+ 
+-    async fetchSensorData() {
+-        try {
+-            const response = await fetch('/api/sensor-data');
+-            if (!response.ok) throw new Error('Failed to fetch sensor data');
+-            const data = await response.json();
+-            this.updateSensorDisplay(data);
+-            this.setConnectionStatus(true);
+-            this.fetchPrediction();
+-        } catch (error) {
+-            console.error('Error fetching sensor data:', error);
+-            this.setConnectionStatus(false);
+-        }
+-    }
++  async fetchSensorData() {
++    try {
++      const response = await fetch("/api/sensor-data");
++      if (!response.ok) throw new Error("Failed to fetch sensor data");
++      const data = await response.json();
++      this.updateSensorDisplay(data);
++      this.setConnectionStatus(true);
++      this.fetchPrediction();
++    } catch (error) {
++      console.error("Error fetching sensor data:", error);
++      this.setConnectionStatus(false);
++    }
++  }
+ 
+-    async fetchPrediction() {
+-        try {
+-            const response = await fetch('/api/predict');
+-            if (!response.ok) throw new Error('Failed to fetch prediction');
+-            const data = await response.json();
+-            this.updatePredictionDisplay(data);
+-        } catch (error) {
+-            console.error('Error fetching prediction:', error);
+-        }
+-    }
++  async fetchPrediction() {
++    try {
++      const response = await fetch("/api/predict");
++      if (!response.ok) throw new Error("Failed to fetch prediction");
++      const data = await response.json();
++      this.updatePredictionDisplay(data);
++    } catch (error) {
++      console.error("Error fetching prediction:", error);
++    }
++  }
+ 
+-    async fetchHistory() {
+-        try {
+-            const response = await fetch('/api/history');
+-            if (!response.ok) throw new Error('Failed to fetch history');
+-            const data = await response.json();
+-            this.updateCharts(data);
+-            this.updatePredictionsTable(data.prediction_history);
+-        } catch (error) {
+-            console.error('Error fetching history:', error);
+-        }
+-    }
++  async fetchHistory() {
++    try {
++      const response = await fetch("/api/history");
++      if (!response.ok) throw new Error("Failed to fetch history");
++      const data = await response.json();
++      this.updateCharts(data);
++      this.updatePredictionsTable(data.prediction_history);
++    } catch (error) {
++      console.error("Error fetching history:", error);
++    }
++  }
+ 
+-    updateSensorDisplay(data) {
+-        const sensorElements = {
+-            'slope-height': data.slope_height_m?.toFixed(1) + ' m',
+-            'slope-angle': data.slope_angle_deg?.toFixed(1) + ' °',
+-            'rainfall': data.rainfall_mm?.toFixed(1) + ' mm',
+-            'vibration': data.vibration_intensity?.toFixed(2),
+-            'cohesion': data.cohesion_kpa?.toFixed(1) + ' kPa',
+-            'temperature': data.temperature_range_c?.toFixed(1) + ' °C',
+-            'groundwater': data.groundwater_depth_m?.toFixed(1) + ' m',
+-            'rqd': data.rqd_percent?.toFixed(1) + ' %'
+-        };
+-        Object.entries(sensorElements).forEach(([id, value]) => {
+-            const element = document.getElementById(id);
+-            if (element) {
+-                element.textContent = value;
+-                element.classList.add('updated');
+-                setTimeout(() => element.classList.remove('updated'), 500);
+-            }
+-        });
+-        this.lastUpdate = new Date();
+-        this.updateLastUpdateTime();
+-    }
++  updateSensorDisplay(data) {
++    const sensorElements = {
++      "slope-height": data.slope_height_m?.toFixed(1) + " m",
++      "slope-angle": data.slope_angle_deg?.toFixed(1) + " °",
++      rainfall: data.rainfall_mm?.toFixed(1) + " mm",
++      vibration: data.vibration_intensity?.toFixed(2),
++      cohesion: data.cohesion_kpa?.toFixed(1) + " kPa",
++      temperature: data.temperature_range_c?.toFixed(1) + " °C",
++      groundwater: data.groundwater_depth_m?.toFixed(1) + " m",
++      rqd: data.rqd_percent?.toFixed(1) + " %",
++    };
++    Object.entries(sensorElements).forEach(([id, value]) => {
++      const element = document.getElementById(id);
++      if (element) {
++        element.textContent = value;
++        element.classList.add("updated");
++        setTimeout(() => element.classList.remove("updated"), 600);
++      }
++    });
++    this.lastUpdate = new Date();
++    this.updateLastUpdateTime();
++  }
+ 
+-    showAlert(title, message, level) {
+-        const alertBanner = document.getElementById('alert-banner');
+-        const alertTitle = document.getElementById('alert-title');
+-        const alertMessage = document.getElementById('alert-message');
+-        if (alertBanner && alertTitle && alertMessage) {
+-            alertTitle.textContent = title + ' RISK DETECTED';
+-            alertMessage.textContent = message;
+-            alertBanner.className = `alert alert-dismissible fade show alert-${level.toLowerCase() === 'critical' ? 'danger' : 'warning'}`;
+-            alertBanner.style.display = 'block';
+-            setTimeout(() => {
+-                alertBanner.classList.remove('show');
+-                setTimeout(() => alertBanner.style.display = 'none', 300);
+-            }, 10000);
+-        }
+-    }
++  showAlert(title, message, level) {
++    const alertBanner = document.getElementById("alert-banner");
++    const alertTitle = document.getElementById("alert-title");
++    const alertMessage = document.getElementById("alert-message");
++    if (alertBanner && alertTitle && alertMessage) {
++      alertTitle.textContent = `${title} RISK DETECTED`;
++      alertMessage.textContent = message;
++      alertBanner.className = `alert alert-dismissible fade show alert-${
++        level.toLowerCase() === "critical" ? "danger" : "warning"
++      }`;
++      alertBanner.style.display = "block";
++      setTimeout(() => {
++        alertBanner.classList.remove("show");
++        setTimeout(() => (alertBanner.style.display = "none"), 300);
++      }, 10000);
++    }
++  }
+ 
+-    setConnectionStatus(connected) {
+-        this.isConnected = connected;
+-        const statusElement = document.getElementById('connection-status');
+-        if (statusElement) {
+-            statusElement.textContent = connected ? 'Connected' : 'Disconnected';
+-            statusElement.className = `badge me-2 ${connected ? 'bg-success' : 'bg-danger'}`;
+-        }
+-    }
++  setConnectionStatus(connected) {
++    this.isConnected = connected;
++    const statusElement = document.getElementById("connection-status");
++    if (statusElement) {
++      statusElement.textContent = connected ? "Connected" : "Disconnected";
++      statusElement.className = `badge me-3 ${connected ? "bg-success" : "bg-danger"}`;
++    }
++  }
+ 
+-    updateLastUpdateTime() {
+-        const lastUpdateElement = document.getElementById('last-update');
+-        if (lastUpdateElement && this.lastUpdate) {
+-            lastUpdateElement.textContent = `Last update: ${this.lastUpdate.toLocaleTimeString()}`;
+-        }
+-    }
++  updateLastUpdateTime() {
++    const lastUpdateElement = document.getElementById("last-update");
++    if (lastUpdateElement && this.lastUpdate) {
++      lastUpdateElement.textContent = `Last update: ${this.lastUpdate.toLocaleTimeString()}`;
++    }
++  }
+ 
+-    updateCharts(data) {
+-        if (data.prediction_history?.length > 0) {
+-            const riskLabels = data.prediction_history.map(item => new Date(item.timestamp));
+-            const riskData = data.prediction_history.map(item => item.confidence);
+-            this.charts.risk.data.labels = riskLabels;
+-            this.charts.risk.data.datasets[0].data = riskData;
+-            this.charts.risk.update('none');
+-        }
+-        if (data.sensor_history?.length > 0) {
+-            const sensorLabels = data.sensor_history.map(item => new Date(item.timestamp));
+-            this.charts.sensor.data.labels = sensorLabels;
+-            this.charts.sensor.data.datasets[0].data = data.sensor_history.map(item => item.slope_height_m);
+-            this.charts.sensor.data.datasets[1].data = data.sensor_history.map(item => item.rainfall_mm);
+-            this.charts.sensor.data.datasets[2].data = data.sensor_history.map(item => item.vibration_intensity);
+-            this.charts.sensor.data.datasets[3].data = data.sensor_history.map(item => item.rqd_percent);
+-            this.charts.sensor.update('none');
+-        }
+-    }
++  updateCharts(data) {
++    if (data.prediction_history?.length > 0) {
++      const riskLabels = data.prediction_history.map((item) => new Date(item.timestamp));
++      const riskData = data.prediction_history.map((item) => item.confidence);
++      this.charts.risk.data.labels = riskLabels;
++      this.charts.risk.data.datasets[0].data = riskData;
++      this.charts.risk.update("none");
++    }
++    if (data.sensor_history?.length > 0) {
++      const sensorLabels = data.sensor_history.map((item) => new Date(item.timestamp));
++      this.charts.sensor.data.labels = sensorLabels;
++      this.charts.sensor.data.datasets[0].data = data.sensor_history.map((item) => item.slope_height_m);
++      this.charts.sensor.data.datasets[1].data = data.sensor_history.map((item) => item.rainfall_mm);
++      this.charts.sensor.data.datasets[2].data = data.sensor_history.map((item) => item.vibration_intensity);
++      this.charts.sensor.data.datasets[3].data = data.sensor_history.map((item) => item.rqd_percent);
++      this.charts.sensor.update("none");
++    }
++  }
+ 
+-    updatePredictionsTable(predictions) {
+-        const tbody = document.getElementById('predictions-table');
+-        if (!tbody || !predictions || predictions.length === 0) return;
+-        tbody.innerHTML = '';
+-        const recentPredictions = predictions.slice(-10).reverse();
+-        recentPredictions.forEach(pred => {
+-            const row = document.createElement('tr');
+-            const timestamp = new Date(pred.timestamp).toLocaleString();
+-            const riskBadge = `<span class="badge ${this.getRiskColorClass(pred.risk_level)}">${pred.risk_level}</span>`;
+-            const confidence = `${(pred.confidence * 100).toFixed(1)}%`;
+-            const classification = pred.prediction_label || 'N/A';
+-            row.innerHTML = `
+-                <td>${timestamp}</td>
+-                <td>${riskBadge}</td>
+-                <td>${confidence}</td>
+-                <td>${classification}</td>
+-                <td><small class="text-muted">Slope conditions analyzed</small></td>
+-            `;
+-            tbody.appendChild(row);
+-        });
+-    }
++  updatePredictionsTable(predictions) {
++    const tbody = document.getElementById("predictions-table");
++    if (!tbody || !predictions || predictions.length === 0) return;
++    tbody.innerHTML = "";
++    // Show latest 10 predictions in reverse chronological order
++    const recentPredictions = predictions.slice(-10).reverse();
++    recentPredictions.forEach((pred) => {
++      const row = document.createElement("tr");
++      const timestamp = new Date(pred.timestamp).toLocaleString();
++      const riskBadge = `<span class="badge ${this.getRiskColorClass(pred.risk_level)}">${pred.risk_level}</span>`;
++      const confidence = `${(pred.confidence * 100).toFixed(1)}%`;
++      const classification = pred.prediction_label || "N/A";
++      row.innerHTML = `
++          <td>${timestamp}</td>
++          <td>${riskBadge}</td>
++          <td>${confidence}</td>
++          <td>${classification}</td>
++          <td><small class="text-muted">Slope conditions analyzed</small></td>
++        `;
++      tbody.appendChild(row);
++    });
++  }
+ 
+-    startDataFetching() {
+-        this.fetchSensorData();
+-        this.fetchHistory();
+-        setInterval(() => {
+-            this.fetchSensorData();
+-            this.fetchHistory();
+-        }, this.updateInterval);
+-        console.log(`Started data fetching with ${this.updateInterval}ms interval`);
+-    }
++  startDataFetching() {
++    this.fetchSensorData();
++    this.fetchHistory();
++    setInterval(() => {
++      this.fetchSensorData();
++      this.fetchHistory();
++    }, this.updateInterval);
++    console.log(`Started data fetching with ${this.updateInterval}ms interval`);
++  }
+ }
+ 
+-document.addEventListener('DOMContentLoaded', () => {
+-    window.dashboard = new RockfallDashboard();
++document.addEventListener("DOMContentLoaded", () => {
++  window.dashboard = new RockfallDashboard();
+ });
+ 
+-document.addEventListener('visibilitychange', () => {
+-    if (!document.hidden && window.dashboard) {
+-        window.dashboard.fetchSensorData();
+-        window.dashboard.fetchHistory();
+-    }
++document.addEventListener("visibilitychange", () => {
++  if (!document.hidden && window.dashboard) {
++    window.dashboard.fetchSensorData();
++    window.dashboard.fetchHistory();
++  }
+ });
+Index: models/static/css/dashboard.css
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+>/* Dashboard Styles */\r\nbody {\r\n    background-color: #f8f9fa;\r\n    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;\r\n}\r\n\r\n/* Risk Indicator */\r\n.risk-indicator {\r\n    display: flex;\r\n    justify-content: center;\r\n    align-items: center;\r\n}\r\n\r\n.risk-circle {\r\n    width: 120px;\r\n    height: 120px;\r\n    border-radius: 50%;\r\n    display: flex;\r\n    align-items: center;\r\n    justify-content: center;\r\n    font-weight: bold;\r\n    font-size: 14px;\r\n    text-align: center;\r\n    transition: all 0.3s ease;\r\n    border: 4px solid;\r\n}\r\n\r\n.risk-circle.low {\r\n    background-color: #d4edda;\r\n    border-color: #28a745;\r\n    color: #155724;\r\n}\r\n\r\n.risk-circle.medium {\r\n    background-color: #fff3cd;\r\n    border-color: #ffc107;\r\n    color: #856404;\r\n}\r\n\r\n.risk-circle.high {\r\n    background-color: #f8d7da;\r\n    border-color: #fd7e14;\r\n    color: #721c24;\r\n}\r\n\r\n.risk-circle.critical {\r\n    background-color: #f5c6cb;\r\n    border-color: #dc3545;\r\n    color: #721c24;\r\n    animation: pulse 2s infinite;\r\n}\r\n\r\n@keyframes pulse {\r\n    0% { transform: scale(1); }\r\n    50% { transform: scale(1.05); }\r\n    100% { transform: scale(1); }\r\n}\r\n\r\n/* Confidence Bar */\r\n.confidence-bar {\r\n    margin: 1rem 0;\r\n}\r\n\r\n.progress {\r\n    height: 25px;\r\n    background-color: #e9ecef;\r\n}\r\n\r\n.progress-bar {\r\n    transition: width 0.5s ease;\r\n    font-weight: bold;\r\n}\r\n\r\n/* Sensor Cards */\r\n.sensor-card {\r\n    background: #fff;\r\n    border: 1px solid #dee2e6;\r\n    border-radius: 8px;\r\n    padding: 15px;\r\n    text-align: center;\r\n    transition: transform 0.2s, box-shadow 0.2s;\r\n    height: 100%;\r\n}\r\n\r\n.sensor-card:hover {\r\n    transform: translateY(-2px);\r\n    box-shadow: 0 4px 8px rgba(0,0,0,0.1);\r\n}\r\n\r\n.sensor-icon {\r\n    font-size: 24px;\r\n    color: #007bff;\r\n    margin-bottom: 8px;\r\n}\r\n\r\n.sensor-label {\r\n    font-size: 12px;\r\n    color: #6c757d;\r\n    margin-bottom: 5px;\r\n    font-weight: 500;\r\n}\r\n\r\n.sensor-value {\r\n    font-size: 18px;\r\n    font-weight: bold;\r\n    color: #495057;\r\n}\r\n\r\n/* Cards */\r\n.card {\r\n    border: none;\r\n    box-shadow: 0 2px 4px rgba(0,0,0,0.1);\r\n    transition: box-shadow 0.3s ease;\r\n}\r\n\r\n.card:hover {\r\n    box-shadow: 0 4px 8px rgba(0,0,0,0.15);\r\n}\r\n\r\n.card-header {\r\n    border-bottom: none;\r\n    font-weight: 600;\r\n}\r\n\r\n/* Charts */\r\n.chart-container {\r\n    position: relative;\r\n    height: 300px;\r\n}\r\n\r\n/* Table */\r\n.table {\r\n    margin-bottom: 0;\r\n}\r\n\r\n.table th {\r\n    border-top: none;\r\n    font-weight: 600;\r\n    color: #495057;\r\n}\r\n\r\n/* Alert Banner */\r\n#alert-banner {\r\n    margin-bottom: 1rem;\r\n    border: none;\r\n    border-left: 4px solid;\r\n}\r\n\r\n#alert-banner.alert-danger {\r\n    border-left-color: #dc3545;\r\n    background-color: #f8d7da;\r\n    color: #721c24;\r\n}\r\n\r\n#alert-banner.alert-warning {\r\n    border-left-color: #ffc107;\r\n    background-color: #fff3cd;\r\n    color: #856404;\r\n}\r\n\r\n/* Connection Status */\r\n#connection-status {\r\n    transition: background-color 0.3s ease;\r\n}\r\n\r\n#connection-status.connected {\r\n    background-color: #28a745 !important;\r\n}\r\n\r\n#connection-status.disconnected {\r\n    background-color: #dc3545 !important;\r\n}\r\n\r\n/* Loading Overlay */\r\n.loading-overlay {\r\n    position: fixed;\r\n    top: 0;\r\n    left: 0;\r\n    width: 100%;\r\n    height: 100%;\r\n    background-color: rgba(0, 0, 0, 0.7);\r\n    display: flex;\r\n    justify-content: center;\r\n    align-items: center;\r\n    z-index: 9999;\r\n    transition: opacity 0.3s ease;\r\n}\r\n\r\n.loading-spinner {\r\n    text-align: center;\r\n    color: white;\r\n}\r\n\r\n.loading-spinner p {\r\n    margin-top: 1rem;\r\n    font-size: 1.1rem;\r\n}\r\n\r\n/* Recommendation */\r\n.recommendation {\r\n    font-size: 14px;\r\n    color: #6c757d;\r\n    margin-bottom: 0;\r\n    padding: 10px;\r\n    background-color: #f8f9fa;\r\n    border-radius: 5px;\r\n    border-left: 4px solid #007bff;\r\n}\r\n\r\n/* Responsive Design */\r\n@media (max-width: 768px) {\r\n    .risk-circle {\r\n        width: 100px;\r\n        height: 100px;\r\n        font-size: 12px;\r\n    }\r\n\r\n    .sensor-card {\r\n        margin-bottom: 15px;\r\n    }\r\n\r\n    .card-header h5 {\r\n        font-size: 1rem;\r\n    }\r\n}\r\n\r\n/* Animation for new data */\r\n.sensor-value.updated {\r\n    animation: highlight 0.5s ease;\r\n}\r\n\r\n@keyframes highlight {\r\n    0% { background-color: #007bff; color: white; }\r\n    100% { background-color: transparent; color: #495057; }\r\n}\r\n\r\n/* Chart responsiveness */\r\ncanvas {\r\n    max-width: 100%;\r\n    height: auto !important;\r\n}\r\n\r\n/* Status badges in table */\r\n.badge {\r\n    font-size: 0.75em;\r\n}\r\n\r\n.badge.bg-success {\r\n    background-color: #28a745 !important;\r\n}\r\n\r\n.badge.bg-warning {\r\n    background-color: #ffc107 !important;\r\n    color: #212529 !important;\r\n}\r\n\r\n.badge.bg-danger {\r\n    background-color: #dc3545 !important;\r\n}\r\n\r\n.badge.bg-info {\r\n    background-color: #17a2b8 !important;\r\n}\r\n\r\n.zone-bar {\r\n    gap: 1rem;\r\n}\r\n.zone-block {\r\n    border-radius: 20px;\r\n    padding: 8px 18px;\r\n    font-weight: bold;\r\n    font-size: 1rem;\r\n    border: 3px solid transparent;\r\n    min-width: 140px;\r\n    text-align: center;\r\n}\r\n.zone-safe {\r\n    background: #d4edda;\r\n    color: #155724;\r\n    border-color: #28a745;\r\n}\r\n.zone-medium {\r\n    background: #fff3cd;\r\n    color: #856404;\r\n    border-color: #ffc107;\r\n}\r\n.zone-danger {\r\n    background: #f8d7da;\r\n    color: #721c24;\r\n    border-color: #dc3545;\r\n    animation: pulse 2s infinite;\r\n}\r\n
+===================================================================
+diff --git a/models/static/css/dashboard.css b/models/static/css/dashboard.css
+--- a/models/static/css/dashboard.css	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/static/css/dashboard.css	(date 1758542378736)
+@@ -1,292 +1,375 @@
+-/* Dashboard Styles */
++/* Dashboard Base Styles */
+ body {
+-    background-color: #f8f9fa;
+-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
++  background-color: #f8f9fa;
++  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
++  color: #495057;
+ }
+ 
+ /* Risk Indicator */
+ .risk-indicator {
+-    display: flex;
+-    justify-content: center;
+-    align-items: center;
++  display: flex;
++  justify-content: center;
++  align-items: center;
+ }
+ 
+ .risk-circle {
+-    width: 120px;
+-    height: 120px;
+-    border-radius: 50%;
+-    display: flex;
+-    align-items: center;
+-    justify-content: center;
+-    font-weight: bold;
+-    font-size: 14px;
+-    text-align: center;
+-    transition: all 0.3s ease;
+-    border: 4px solid;
++  width: 140px;
++  height: 140px;
++  border-radius: 50%;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-weight: 700;
++  font-size: 1.25rem;
++  text-align: center;
++  transition: all 0.4s ease;
++  border: 5px solid;
++  user-select: none;
+ }
+ 
+ .risk-circle.low {
+-    background-color: #d4edda;
+-    border-color: #28a745;
+-    color: #155724;
++  background-color: #d4edda;
++  border-color: #28a745;
++  color: #155724;
+ }
+ 
+ .risk-circle.medium {
+-    background-color: #fff3cd;
+-    border-color: #ffc107;
+-    color: #856404;
++  background-color: #fff3cd;
++  border-color: #ffc107;
++  color: #856404;
+ }
+ 
+ .risk-circle.high {
+-    background-color: #f8d7da;
+-    border-color: #fd7e14;
+-    color: #721c24;
++  background-color: #f8d7da;
++  border-color: #fd7e14;
++  color: #721c24;
+ }
+ 
+ .risk-circle.critical {
+-    background-color: #f5c6cb;
+-    border-color: #dc3545;
+-    color: #721c24;
+-    animation: pulse 2s infinite;
++  background-color: #f5c6cb;
++  border-color: #dc3545;
++  color: #721c24;
++  animation: pulse 2s infinite;
+ }
+ 
+ @keyframes pulse {
+-    0% { transform: scale(1); }
+-    50% { transform: scale(1.05); }
+-    100% { transform: scale(1); }
++  0% {
++    transform: scale(1);
++  }
++
++  50% {
++    transform: scale(1.07);
++  }
++
++  100% {
++    transform: scale(1);
++  }
+ }
+ 
+ /* Confidence Bar */
+ .confidence-bar {
+-    margin: 1rem 0;
++  margin: 1rem 0;
+ }
+ 
+ .progress {
+-    height: 25px;
+-    background-color: #e9ecef;
++  height: 28px;
++  background-color: #e9ecef;
++  border-radius: 8px;
+ }
+ 
+ .progress-bar {
+-    transition: width 0.5s ease;
+-    font-weight: bold;
++  transition: width 0.5s ease;
++  font-weight: 700;
++  display: flex;
++  align-items: center;
++  justify-content: center;
++  font-size: 1.1rem;
++  color: white;
++  border-radius: 8px;
++}
++
++.progress-bar.bg-success {
++  background: linear-gradient(45deg, #28a745, #2ecc40);
++}
++
++.progress-bar.bg-warning {
++  background: linear-gradient(45deg, #ffc107, #ffca2c);
++  color: #212529;
++}
++
++.progress-bar.bg-danger {
++  background: linear-gradient(45deg, #dc3545, #ff3b3b);
++}
++
++.progress-bar.bg-secondary {
++  background: #6c757d;
+ }
+ 
+ /* Sensor Cards */
+ .sensor-card {
+-    background: #fff;
+-    border: 1px solid #dee2e6;
+-    border-radius: 8px;
+-    padding: 15px;
+-    text-align: center;
+-    transition: transform 0.2s, box-shadow 0.2s;
+-    height: 100%;
++  background: #fff;
++  border: 1px solid #dee2e6;
++  border-radius: 10px;
++  padding: 15px;
++  text-align: center;
++  transition: transform 0.3s ease, box-shadow 0.3s ease;
++  height: 100%;
++  min-height: 110px;
++  display: flex;
++  flex-direction: column;
++  justify-content: center;
+ }
+ 
++.sensor-card:focus,
+ .sensor-card:hover {
+-    transform: translateY(-2px);
+-    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
++  outline: none;
++  transform: translateY(-4px);
++  box-shadow: 0 8px 15px rgba(0, 0, 0, 0.15);
++  cursor: pointer;
+ }
+ 
+ .sensor-icon {
+-    font-size: 24px;
+-    color: #007bff;
+-    margin-bottom: 8px;
++  font-size: 28px;
++  color: #007bff;
++  margin-bottom: 8px;
+ }
+ 
+ .sensor-label {
+-    font-size: 12px;
+-    color: #6c757d;
+-    margin-bottom: 5px;
+-    font-weight: 500;
++  font-size: 13px;
++  color: #6c757d;
++  font-weight: 600;
++  margin-bottom: 6px;
++  text-transform: uppercase;
++  letter-spacing: 0.05em;
+ }
+ 
+ .sensor-value {
+-    font-size: 18px;
+-    font-weight: bold;
+-    color: #495057;
++  font-size: 20px;
++  font-weight: 700;
++  color: #212529;
++  user-select: text;
++}
++
++/* Animation for value updates */
++.sensor-value.updated {
++  animation: highlight 0.6s ease;
++}
++
++@keyframes highlight {
++  0% {
++    background-color: #007bff;
++    color: white;
++  }
++
++  100% {
++    background-color: transparent;
++    color: #212529;
++  }
+ }
+ 
+ /* Cards */
+ .card {
+-    border: none;
+-    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+-    transition: box-shadow 0.3s ease;
++  border: none;
++  box-shadow: 0 2px 7px rgba(0, 0, 0, 0.07);
++  transition: box-shadow 0.3s ease;
++  border-radius: 12px;
+ }
+ 
+ .card:hover {
+-    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
++  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+ }
+ 
++/* Card Headers */
+ .card-header {
+-    border-bottom: none;
+-    font-weight: 600;
+-}
+-
+-/* Charts */
+-.chart-container {
+-    position: relative;
+-    height: 300px;
+-}
+-
+-/* Table */
+-.table {
+-    margin-bottom: 0;
+-}
+-
+-.table th {
+-    border-top: none;
+-    font-weight: 600;
+-    color: #495057;
++  border-bottom: none;
++  font-weight: 700;
++  letter-spacing: 0.03em;
++  padding: 0.75rem 1.25rem;
+ }
+ 
+ /* Alert Banner */
+ #alert-banner {
+-    margin-bottom: 1rem;
+-    border: none;
+-    border-left: 4px solid;
++  margin-bottom: 1rem;
++  border: none;
++  border-left: 5px solid;
++  font-weight: 600;
++  user-select: none;
++  border-radius: 6px;
++  transition: background-color 0.3s ease, border-color 0.3s ease, opacity 0.6s ease;
+ }
+ 
+ #alert-banner.alert-danger {
+-    border-left-color: #dc3545;
+-    background-color: #f8d7da;
+-    color: #721c24;
++  border-left-color: #dc3545;
++  background-color: #f8d7da;
++  color: #721c24;
+ }
+ 
+ #alert-banner.alert-warning {
+-    border-left-color: #ffc107;
+-    background-color: #fff3cd;
+-    color: #856404;
++  border-left-color: #ffc107;
++  background-color: #fff3cd;
++  color: #856404;
+ }
+ 
+ /* Connection Status */
+ #connection-status {
+-    transition: background-color 0.3s ease;
++  transition: background-color 0.35s ease;
++  font-weight: 600;
++  font-size: 0.9rem;
++  padding: 0.45em 0.85em;
++  user-select: none;
++  border-radius: 20px;
++  min-width: 90px;
++  text-align: center;
+ }
+ 
+-#connection-status.connected {
+-    background-color: #28a745 !important;
++#connection-status.bg-success {
++  background-color: #28a745 !important;
+ }
+ 
+-#connection-status.disconnected {
+-    background-color: #dc3545 !important;
++#connection-status.bg-danger {
++  background-color: #dc3545 !important;
+ }
+ 
+ /* Loading Overlay */
+ .loading-overlay {
+-    position: fixed;
+-    top: 0;
+-    left: 0;
+-    width: 100%;
+-    height: 100%;
+-    background-color: rgba(0, 0, 0, 0.7);
+-    display: flex;
+-    justify-content: center;
+-    align-items: center;
+-    z-index: 9999;
+-    transition: opacity 0.3s ease;
++  position: fixed;
++  top: 0;
++  left: 0;
++  width: 100%;
++  height: 100%;
++  background-color: rgba(0, 0, 0, 0.75);
++  display: flex;
++  justify-content: center;
++  align-items: center;
++  z-index: 1050;
++  opacity: 1;
++  transition: opacity 0.4s ease;
++  user-select: none;
+ }
+ 
+ .loading-spinner {
+-    text-align: center;
+-    color: white;
++  text-align: center;
++  color: white;
+ }
+ 
+ .loading-spinner p {
+-    margin-top: 1rem;
+-    font-size: 1.1rem;
++  margin-top: 1rem;
++  font-size: 1.25rem;
++  font-weight: 600;
+ }
+ 
+-/* Recommendation */
++/* Recommendation Box */
+ .recommendation {
+-    font-size: 14px;
+-    color: #6c757d;
+-    margin-bottom: 0;
+-    padding: 10px;
+-    background-color: #f8f9fa;
+-    border-radius: 5px;
+-    border-left: 4px solid #007bff;
++  font-size: 1rem;
++  color: #6c757d;
++  padding: 10px 15px;
++  border-radius: 6px;
++  margin: 0;
++  background-color: #f8f9fa;
++  border-left: 5px solid #007bff;
++  user-select: none;
+ }
+ 
+-/* Responsive Design */
++/* Responsive Adjustments */
+ @media (max-width: 768px) {
+-    .risk-circle {
+-        width: 100px;
+-        height: 100px;
+-        font-size: 12px;
+-    }
++  .risk-circle {
++    width: 110px;
++    height: 110px;
++    font-size: 1rem;
++    border-width: 4px;
++  }
+ 
+-    .sensor-card {
+-        margin-bottom: 15px;
+-    }
++  .sensor-card {
++    min-height: 95px;
++    font-size: 0.9rem;
++  }
+ 
+-    .card-header h5 {
+-        font-size: 1rem;
+-    }
++  .card-header h5 {
++    font-size: 1.1rem;
++  }
+ }
+-
+-/* Animation for new data */
+-.sensor-value.updated {
+-    animation: highlight 0.5s ease;
+-}
+-
+-@keyframes highlight {
+-    0% { background-color: #007bff; color: white; }
+-    100% { background-color: transparent; color: #495057; }
+-}
+-
+-/* Chart responsiveness */
+-canvas {
+-    max-width: 100%;
+-    height: auto !important;
+-}
+-
+-/* Status badges in table */
+-.badge {
+-    font-size: 0.75em;
+-}
+-
+-.badge.bg-success {
+-    background-color: #28a745 !important;
+-}
+-
+-.badge.bg-warning {
+-    background-color: #ffc107 !important;
+-    color: #212529 !important;
+-}
+-
+-.badge.bg-danger {
+-    background-color: #dc3545 !important;
+-}
+-
+-.badge.bg-info {
+-    background-color: #17a2b8 !important;
+-}
+ 
++/* Zone Status Bar */
+ .zone-bar {
+-    gap: 1rem;
++  gap: 1rem;
++  flex-wrap: wrap;
++  justify-content: center;
+ }
++
+ .zone-block {
+-    border-radius: 20px;
+-    padding: 8px 18px;
+-    font-weight: bold;
+-    font-size: 1rem;
+-    border: 3px solid transparent;
+-    min-width: 140px;
+-    text-align: center;
++  border-radius: 20px;
++  padding: 10px 22px;
++  font-weight: 700;
++  font-size: 1rem;
++  border: 3px solid transparent;
++  min-width: 140px;
++  text-align: center;
++  user-select: none;
++  transition: all 0.4s ease;
+ }
++
+ .zone-safe {
+-    background: #d4edda;
+-    color: #155724;
+-    border-color: #28a745;
++  background: #d4edda;
++  color: #155724;
++  border-color: #28a745;
+ }
++
+ .zone-medium {
+-    background: #fff3cd;
+-    color: #856404;
+-    border-color: #ffc107;
++  background: #fff3cd;
++  color: #856404;
++  border-color: #ffc107;
+ }
++
+ .zone-danger {
+-    background: #f8d7da;
+-    color: #721c24;
+-    border-color: #dc3545;
+-    animation: pulse 2s infinite;
++  background: #f8d7da;
++  color: #721c24;
++  border-color: #dc3545;
++  animation: pulse 2s infinite;
+ }
++
++/* Chart Canvas Responsive */
++canvas {
++  max-width: 100%;
++  height: auto !important;
++  user-select: none;
++}
++
++/* Table Styling */
++.table {
++  margin-bottom: 0;
++  font-size: 0.9rem;
++}
++
++.table th {
++  border-top: none;
++  font-weight: 700;
++  color: #495057;
++}
++
++.badge {
++  font-size: 0.75em;
++  padding: 0.35em 0.6em;
++}
++
++.badge.bg-success {
++  background-color: #28a745 !important;
++}
++
++.badge.bg-warning {
++  background-color: #ffc107 !important;
++  color: #212529 !important;
++}
++
++.badge.bg-danger {
++  background-color: #dc3545 !important;
++}
++
++.badge.bg-info {
++  background-color: #17a2b8 !important;
++}
++
++/* Scroll Table Responsive */
++.table-responsive {
++  overflow-x: auto;
++}
++
+Index: models/templates/index.html
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.BaseRevisionTextPatchEP
+<+><!DOCTYPE html>\r\n<html lang=\"en\">\r\n<head>\r\n    <meta charset=\"UTF-8\" />\r\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\r\n    <title>Rockfall Prediction Dashboard</title>\r\n    <link\r\n        href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css\"\r\n        rel=\"stylesheet\"\r\n    />\r\n    <link\r\n        href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css\"\r\n        rel=\"stylesheet\"\r\n    />\r\n    <link href=\"{{ url_for('static', filename='css/dashboard.css') }}\" rel=\"stylesheet\" />\r\n    <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>\r\n    <script src=\"https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js\"></script>\r\n</head>\r\n<body>\r\n    <div class=\"container-fluid\">\r\n        <!-- Header -->\r\n        <div class=\"row bg-dark text-white py-3 mb-4\">\r\n            <div class=\"col\">\r\n                <h1 class=\"mb-0\">\r\n                    RockBotz\r\n                </h1>\r\n                <p class=\"mb-0\">Real-time monitoring and rock fall prediction system</p>\r\n            </div>\r\n            <div class=\"col-auto\">\r\n                <div class=\"d-flex align-items-center\">\r\n                    <span class=\"badge bg-success me-2\" id=\"connection-status\">\r\n                        Connected\r\n                    </span>\r\n                    <span id=\"last-update\">Loading...</span>\r\n                </div>\r\n            </div>\r\n        </div>\r\n\r\n        <!-- Alert Banner -->\r\n        <div id=\"alert-banner\" class=\"alert alert-dismissible fade\" role=\"alert\" style=\"display: none\">\r\n            <div class=\"d-flex align-items-center\">\r\n                <i class=\"fas fa-exclamation-triangle me-2\"></i>\r\n                <div>\r\n                    <strong id=\"alert-title\">Alert</strong>\r\n                    <div id=\"alert-message\"></div>\r\n                </div>\r\n            </div>\r\n        </div>\r\n\r\n        <!-- Main Dashboard -->\r\n        <div class=\"row\">\r\n            <!-- Current Status Cards -->\r\n            <div class=\"col-lg-4 mb-4\">\r\n                <div class=\"card\">\r\n                    <div class=\"card-header bg-primary text-white\">\r\n                        <h5 class=\"mb-0\"><i class=\"fas fa-shield-alt\"></i> Current Risk Level</h5>\r\n                    </div>\r\n                    <div class=\"card-body text-center\">\r\n                        <div class=\"risk-indicator mb-3\" id=\"risk-indicator\">\r\n                            <div class=\"risk-circle\" id=\"risk-circle\">\r\n                                <span id=\"risk-level\">LOADING</span>\r\n                            </div>\r\n                        </div>\r\n                        <div class=\"confidence-bar mb-3\">\r\n                            <div class=\"progress\">\r\n                                <div\r\n                                    class=\"progress-bar\"\r\n                                    id=\"confidence-bar\"\r\n                                    role=\"progressbar\"\r\n                                    style=\"width: 0%\"\r\n                                >\r\n                                    <span id=\"confidence-text\">0%</span>\r\n                                </div>\r\n                            </div>\r\n                        </div>\r\n                        <p class=\"recommendation\" id=\"recommendation\">\r\n                            Initializing system...\r\n                        </p>\r\n                    </div>\r\n                </div>\r\n            </div>\r\n\r\n            <!-- Live Sensor Data -->\r\n            <div class=\"col-lg-8 mb-4\">\r\n                <div class=\"card\">\r\n                    <div class=\"card-header bg-info text-white\">\r\n                        <h5 class=\"mb-0\"><i class=\"fas fa-satellite-dish\"></i> Live Sensor Readings</h5>\r\n                    </div>\r\n                    <div class=\"card-body\">\r\n                        <div class=\"row\">\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-ruler-vertical\"></i></div>\r\n                                    <div class=\"sensor-label\">Slope Height</div>\r\n                                    <div class=\"sensor-value\" id=\"slope-height\">-- m</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-angle-left\"></i></div>\r\n                                    <div class=\"sensor-label\">Slope Angle</div>\r\n                                    <div class=\"sensor-value\" id=\"slope-angle\">-- °</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-cloud-rain\"></i></div>\r\n                                    <div class=\"sensor-label\">Rainfall</div>\r\n                                    <div class=\"sensor-value\" id=\"rainfall\">-- mm</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-wave-square\"></i></div>\r\n                                    <div class=\"sensor-label\">Vibration</div>\r\n                                    <div class=\"sensor-value\" id=\"vibration\">--</div>\r\n                                </div>\r\n                            </div>\r\n                        </div>\r\n                        <div class=\"row\">\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-compress-arrows-alt\"></i></div>\r\n                                    <div class=\"sensor-label\">Cohesion</div>\r\n                                    <div class=\"sensor-value\" id=\"cohesion\">-- kPa</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-thermometer-half\"></i></div>\r\n                                    <div class=\"sensor-label\">Temperature Range</div>\r\n                                    <div class=\"sensor-value\" id=\"temperature\">-- °C</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-tint\"></i></div>\r\n                                    <div class=\"sensor-label\">Groundwater</div>\r\n                                    <div class=\"sensor-value\" id=\"groundwater\">-- m</div>\r\n                                </div>\r\n                            </div>\r\n                            <div class=\"col-md-3 mb-3\">\r\n                                <div class=\"sensor-card\">\r\n                                    <div class=\"sensor-icon\"><i class=\"fas fa-gem\"></i></div>\r\n                                    <div class=\"sensor-label\">RQD</div>\r\n                                    <div class=\"sensor-value\" id=\"rqd\">-- %</div>\r\n                                </div>\r\n                            </div>\r\n                        </div>\r\n                    </div>\r\n                </div>\r\n            </div>\r\n        </div>\r\n\r\n        <div class=\"row mb-3\">\r\n  <div class=\"col-12\">\r\n    <div id=\"zone-status-bar\" class=\"zone-bar d-flex align-items-center justify-content-center\">\r\n      <!-- Populated dynamically -->\r\n    </div>\r\n  </div>\r\n</div>\r\n\r\n\r\n        <!-- Charts Row -->\r\n        <div class=\"row\">\r\n            <!-- Risk Level History -->\r\n            <div class=\"col-lg-6 mb-4\">\r\n                <div class=\"card\">\r\n                    <div class=\"card-header bg-warning text-dark\">\r\n                        <h5 class=\"mb-0\"><i class=\"fas fa-chart-line\"></i> Risk Level History</h5>\r\n                    </div>\r\n                    <div class=\"card-body\">\r\n                        <canvas id=\"riskChart\" height=\"200\"></canvas>\r\n                    </div>\r\n                </div>\r\n            </div>\r\n\r\n            <!-- Sensor Trends -->\r\n            <div class=\"col-lg-6 mb-4\">\r\n                <div class=\"card\">\r\n                    <div class=\"card-header bg-success text-white\">\r\n                        <h5 class=\"mb-0\"><i class=\"fas fa-chart-area\"></i> Key Sensor Trends</h5>\r\n                    </div>\r\n                    <div class=\"card-body\">\r\n                        <canvas id=\"sensorChart\" height=\"200\"></canvas>\r\n                    </div>\r\n                </div>\r\n            </div>\r\n        </div>\r\n\r\n        <!-- Detailed Sensor Data -->\r\n        <div class=\"row\">\r\n            <div class=\"col-12 mb-4\">\r\n                <div class=\"card\">\r\n                    <div class=\"card-header bg-secondary text-white\">\r\n                        <h5 class=\"mb-0\"><i class=\"fas fa-table\"></i> Recent Predictions</h5>\r\n                    </div>\r\n                    <div class=\"card-body\">\r\n                        <div class=\"table-responsive\">\r\n                            <table class=\"table table-striped table-hover\">\r\n                                <thead>\r\n                                    <tr>\r\n                                        <th>Timestamp</th>\r\n                                        <th>Risk Level</th>\r\n                                        <th>Confidence</th>\r\n                                        <th>Classification</th>\r\n                                        <th>Key Factors</th>\r\n                                    </tr>\r\n                                </thead>\r\n                                <tbody id=\"predictions-table\">\r\n                                    <tr>\r\n                                        <td colspan=\"5\" class=\"text-center\">Loading predictions...</td>\r\n                                    </tr>\r\n                                </tbody>\r\n                            </table>\r\n                        </div>\r\n                    </div>\r\n                </div>\r\n            </div>\r\n        </div>\r\n    </div>\r\n\r\n    <!-- Loading Overlay -->\r\n    <div id=\"loading-overlay\" class=\"loading-overlay\">\r\n        <div class=\"loading-spinner\">\r\n            <i class=\"fas fa-spinner fa-spin fa-3x\"></i>\r\n            <p>Loading dashboard...</p>\r\n        </div>\r\n    </div>\r\n\r\n<!-- Zone Status -->\r\n<!--<div class=\"row mb-3\">-->\r\n<!--  <div class=\"col-12\">-->\r\n<!--    <div id=\"zone-status-bar\" class=\"zone-bar d-flex align-items-center justify-content-center\">-->\r\n<!--      &lt;!&ndash; Populated dynamically &ndash;&gt;-->\r\n<!--    </div>-->\r\n<!--  </div>-->\r\n<!--</div>-->\r\n\r\n    <!-- Scripts -->\r\n    <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js\"></script>\r\n    <script src=\"{{ url_for('static', filename='js/dashboard.js') }}\"></script>\r\n<link href=\"{{ url_for('static', filename='css/dashboard.css') }}\" rel=\"stylesheet\" />\r\n<script src=\"{{ url_for('static', filename='js/dashboard.js') }}\"></script>\r\n\r\n</body>\r\n</html>\r\n
+===================================================================
+diff --git a/models/templates/index.html b/models/templates/index.html
+--- a/models/templates/index.html	(revision 47a838edc117b78ea96c2abdbd8cf889bcd977bc)
++++ b/models/templates/index.html	(date 1758542361589)
+@@ -1,247 +1,220 @@
+ <!DOCTYPE html>
+ <html lang="en">
++
+ <head>
+-    <meta charset="UTF-8" />
+-    <meta name="viewport" content="width=device-width, initial-scale=1" />
+-    <title>Rockfall Prediction Dashboard</title>
+-    <link
+-        href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css"
+-        rel="stylesheet"
+-    />
+-    <link
+-        href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css"
+-        rel="stylesheet"
+-    />
+-    <link href="{{ url_for('static', filename='css/dashboard.css') }}" rel="stylesheet" />
+-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+-    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
++  <meta charset="UTF-8" />
++  <meta name="viewport" content="width=device-width, initial-scale=1" />
++  <title>Rockfall Prediction Dashboard</title>
++  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet" />
++  <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet" />
++  <link href="{{ url_for('static', filename='css/dashboard.css') }}" rel="stylesheet" />
++  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
++  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+ </head>
++
+ <body>
+-    <div class="container-fluid">
+-        <!-- Header -->
+-        <div class="row bg-dark text-white py-3 mb-4">
+-            <div class="col">
+-                <h1 class="mb-0">
+-                    RockBotz
+-                </h1>
+-                <p class="mb-0">Real-time monitoring and rock fall prediction system</p>
+-            </div>
+-            <div class="col-auto">
+-                <div class="d-flex align-items-center">
+-                    <span class="badge bg-success me-2" id="connection-status">
+-                        Connected
+-                    </span>
+-                    <span id="last-update">Loading...</span>
+-                </div>
+-            </div>
+-        </div>
++  <div class="container-fluid px-3 py-3">
++    <!-- Header -->
++    <header class="d-flex flex-column flex-md-row align-items-center justify-content-between py-3 mb-4 border-bottom">
++      <div>
++        <h1 class="h3 mb-0">RockBotz</h1>
++        <small class="text-muted">Real-time monitoring and rock fall prediction system</small>
++      </div>
++      <div class="d-flex align-items-center mt-3 mt-md-0">
++        <span id="connection-status" class="badge bg-success me-3">Connected</span>
++        <small id="last-update" class="text-muted">Loading...</small>
++      </div>
++    </header>
+ 
+-        <!-- Alert Banner -->
+-        <div id="alert-banner" class="alert alert-dismissible fade" role="alert" style="display: none">
+-            <div class="d-flex align-items-center">
+-                <i class="fas fa-exclamation-triangle me-2"></i>
+-                <div>
+-                    <strong id="alert-title">Alert</strong>
+-                    <div id="alert-message"></div>
+-                </div>
+-            </div>
+-        </div>
++    <!-- Alert Banner -->
++    <div id="alert-banner" class="alert alert-dismissible fade" role="alert" style="display: none" aria-live="assertive" aria-atomic="true">
++      <div class="d-flex align-items-center">
++        <i class="fas fa-exclamation-triangle me-2"></i>
++        <div>
++          <strong id="alert-title">Alert</strong>
++          <div id="alert-message"></div>
++        </div>
++      </div>
++    </div>
+ 
+-        <!-- Main Dashboard -->
+-        <div class="row">
+-            <!-- Current Status Cards -->
+-            <div class="col-lg-4 mb-4">
+-                <div class="card">
+-                    <div class="card-header bg-primary text-white">
+-                        <h5 class="mb-0"><i class="fas fa-shield-alt"></i> Current Risk Level</h5>
+-                    </div>
+-                    <div class="card-body text-center">
+-                        <div class="risk-indicator mb-3" id="risk-indicator">
+-                            <div class="risk-circle" id="risk-circle">
+-                                <span id="risk-level">LOADING</span>
+-                            </div>
+-                        </div>
+-                        <div class="confidence-bar mb-3">
+-                            <div class="progress">
+-                                <div
+-                                    class="progress-bar"
+-                                    id="confidence-bar"
+-                                    role="progressbar"
+-                                    style="width: 0%"
+-                                >
+-                                    <span id="confidence-text">0%</span>
+-                                </div>
+-                            </div>
+-                        </div>
+-                        <p class="recommendation" id="recommendation">
+-                            Initializing system...
+-                        </p>
+-                    </div>
+-                </div>
+-            </div>
++    <!-- Current Status and Live Sensors Row -->
++    <div class="row g-3 mb-4">
++      <!-- Risk Card -->
++      <section class="col-12 col-lg-4">
++        <div class="card h-100 shadow-sm">
++          <div class="card-header bg-primary text-white d-flex align-items-center gap-2">
++            <i class="fas fa-shield-alt fa-lg"></i>
++            <h5 class="mb-0">Current Risk Level</h5>
++          </div>
++          <div class="card-body d-flex flex-column align-items-center justify-content-center text-center">
++            <div class="risk-indicator mb-3" id="risk-indicator" aria-live="polite" aria-atomic="true" role="region">
++              <div class="risk-circle" id="risk-circle" tabindex="0" aria-label="Current risk level">
++                <span id="risk-level" class="fs-5 fw-bold">LOADING</span>
++              </div>
++            </div>
++            <div class="confidence-bar w-100 mb-3" aria-label="Confidence level">
++              <div class="progress" style="height: 28px;">
++                <div class="progress-bar" id="confidence-bar" role="progressbar" style="width: 0%" aria-valuemin="0"
++                  aria-valuemax="100" aria-valuenow="0">
++                  <span id="confidence-text">0%</span>
++                </div>
++              </div>
++            </div>
++            <p class="recommendation px-3 rounded border-start border-4 border-primary" id="recommendation" aria-live="polite"
++              aria-atomic="true">
++              Initializing system...
++            </p>
++          </div>
++        </div>
++      </section>
+ 
+-            <!-- Live Sensor Data -->
+-            <div class="col-lg-8 mb-4">
+-                <div class="card">
+-                    <div class="card-header bg-info text-white">
+-                        <h5 class="mb-0"><i class="fas fa-satellite-dish"></i> Live Sensor Readings</h5>
+-                    </div>
+-                    <div class="card-body">
+-                        <div class="row">
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-ruler-vertical"></i></div>
+-                                    <div class="sensor-label">Slope Height</div>
+-                                    <div class="sensor-value" id="slope-height">-- m</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-angle-left"></i></div>
+-                                    <div class="sensor-label">Slope Angle</div>
+-                                    <div class="sensor-value" id="slope-angle">-- °</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-cloud-rain"></i></div>
+-                                    <div class="sensor-label">Rainfall</div>
+-                                    <div class="sensor-value" id="rainfall">-- mm</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-wave-square"></i></div>
+-                                    <div class="sensor-label">Vibration</div>
+-                                    <div class="sensor-value" id="vibration">--</div>
+-                                </div>
+-                            </div>
+-                        </div>
+-                        <div class="row">
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-compress-arrows-alt"></i></div>
+-                                    <div class="sensor-label">Cohesion</div>
+-                                    <div class="sensor-value" id="cohesion">-- kPa</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-thermometer-half"></i></div>
+-                                    <div class="sensor-label">Temperature Range</div>
+-                                    <div class="sensor-value" id="temperature">-- °C</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-tint"></i></div>
+-                                    <div class="sensor-label">Groundwater</div>
+-                                    <div class="sensor-value" id="groundwater">-- m</div>
+-                                </div>
+-                            </div>
+-                            <div class="col-md-3 mb-3">
+-                                <div class="sensor-card">
+-                                    <div class="sensor-icon"><i class="fas fa-gem"></i></div>
+-                                    <div class="sensor-label">RQD</div>
+-                                    <div class="sensor-value" id="rqd">-- %</div>
+-                                </div>
+-                            </div>
+-                        </div>
+-                    </div>
+-                </div>
+-            </div>
+-        </div>
++      <!-- Live Sensors Card -->
++      <section class="col-12 col-lg-8">
++        <div class="card h-100 shadow-sm">
++          <div class="card-header bg-info text-white d-flex align-items-center gap-2">
++            <i class="fas fa-satellite-dish fa-lg"></i>
++            <h5 class="mb-0">Live Sensor Readings</h5>
++          </div>
++          <div class="card-body py-3">
++            <div class="row g-3">
++              <!-- Sensor Cards -->
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Slope Height value">
++                  <div class="sensor-icon"><i class="fas fa-ruler-vertical"></i></div>
++                  <div class="sensor-label">Slope Height</div>
++                  <div class="sensor-value" id="slope-height">-- m</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Slope Angle value">
++                  <div class="sensor-icon"><i class="fas fa-angle-left"></i></div>
++                  <div class="sensor-label">Slope Angle</div>
++                  <div class="sensor-value" id="slope-angle">-- °</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Rainfall value">
++                  <div class="sensor-icon"><i class="fas fa-cloud-rain"></i></div>
++                  <div class="sensor-label">Rainfall</div>
++                  <div class="sensor-value" id="rainfall">-- mm</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Vibration value">
++                  <div class="sensor-icon"><i class="fas fa-wave-square"></i></div>
++                  <div class="sensor-label">Vibration</div>
++                  <div class="sensor-value" id="vibration">--</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Cohesion value">
++                  <div class="sensor-icon"><i class="fas fa-compress-arrows-alt"></i></div>
++                  <div class="sensor-label">Cohesion</div>
++                  <div class="sensor-value" id="cohesion">-- kPa</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Temperature Range value">
++                  <div class="sensor-icon"><i class="fas fa-thermometer-half"></i></div>
++                  <div class="sensor-label">Temperature Range</div>
++                  <div class="sensor-value" id="temperature">-- °C</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="Groundwater Depth value">
++                  <div class="sensor-icon"><i class="fas fa-tint"></i></div>
++                  <div class="sensor-label">Groundwater</div>
++                  <div class="sensor-value" id="groundwater">-- m</div>
++                </div>
++              </div>
++              <div class="col-6 col-md-3">
++                <div class="sensor-card" tabindex="0" aria-label="RQD value">
++                  <div class="sensor-icon"><i class="fas fa-gem"></i></div>
++                  <div class="sensor-label">RQD</div>
++                  <div class="sensor-value" id="rqd">-- %</div>
++                </div>
++              </div>
++            </div>
++          </div>
++        </div>
++      </section>
++    </div>
+ 
+-        <div class="row mb-3">
+-  <div class="col-12">
+-    <div id="zone-status-bar" class="zone-bar d-flex align-items-center justify-content-center">
+-      <!-- Populated dynamically -->
+-    </div>
+-  </div>
+-</div>
+-
++    <!-- Zone Status Bar -->
++    <section class="mb-4">
++      <div id="zone-status-bar" class="zone-bar d-flex justify-content-center gap-3 flex-wrap" aria-label="Zone risk statuses">
++        <!-- Populated dynamically -->
++      </div>
++    </section>
+ 
+-        <!-- Charts Row -->
+-        <div class="row">
+-            <!-- Risk Level History -->
+-            <div class="col-lg-6 mb-4">
+-                <div class="card">
+-                    <div class="card-header bg-warning text-dark">
+-                        <h5 class="mb-0"><i class="fas fa-chart-line"></i> Risk Level History</h5>
+-                    </div>
+-                    <div class="card-body">
+-                        <canvas id="riskChart" height="200"></canvas>
+-                    </div>
+-                </div>
+-            </div>
+-
+-            <!-- Sensor Trends -->
+-            <div class="col-lg-6 mb-4">
+-                <div class="card">
+-                    <div class="card-header bg-success text-white">
+-                        <h5 class="mb-0"><i class="fas fa-chart-area"></i> Key Sensor Trends</h5>
+-                    </div>
+-                    <div class="card-body">
+-                        <canvas id="sensorChart" height="200"></canvas>
+-                    </div>
+-                </div>
+-            </div>
+-        </div>
++    <!-- Charts Row -->
++    <div class="row g-4 mb-4">
++      <!-- Risk Chart -->
++      <section class="col-12 col-lg-6">
++        <div class="card h-100 shadow-sm">
++          <div class="card-header bg-warning text-dark d-flex align-items-center gap-2">
++            <i class="fas fa-chart-line fa-lg"></i>
++            <h5 class="mb-0">Risk Level History</h5>
++          </div>
++          <div class="card-body p-3">
++            <canvas id="riskChart" aria-label="Risk confidence chart" role="img" height="220"></canvas>
++          </div>
++        </div>
++      </section>
++
++      <!-- Sensor Chart -->
++      <section class="col-12 col-lg-6">
++        <div class="card h-100 shadow-sm">
++          <div class="card-header bg-success text-white d-flex align-items-center gap-2">
++            <i class="fas fa-chart-area fa-lg"></i>
++            <h5 class="mb-0">Key Sensor Trends</h5>
++          </div>
++          <div class="card-body p-3">
++            <canvas id="sensorChart" aria-label="Key sensor parameters chart" role="img" height="220"></canvas>
++          </div>
++        </div>
++      </section>
++    </div>
+ 
+-        <!-- Detailed Sensor Data -->
+-        <div class="row">
+-            <div class="col-12 mb-4">
+-                <div class="card">
+-                    <div class="card-header bg-secondary text-white">
+-                        <h5 class="mb-0"><i class="fas fa-table"></i> Recent Predictions</h5>
+-                    </div>
+-                    <div class="card-body">
+-                        <div class="table-responsive">
+-                            <table class="table table-striped table-hover">
+-                                <thead>
+-                                    <tr>
+-                                        <th>Timestamp</th>
+-                                        <th>Risk Level</th>
+-                                        <th>Confidence</th>
+-                                        <th>Classification</th>
+-                                        <th>Key Factors</th>
+-                                    </tr>
+-                                </thead>
+-                                <tbody id="predictions-table">
+-                                    <tr>
+-                                        <td colspan="5" class="text-center">Loading predictions...</td>
+-                                    </tr>
+-                                </tbody>
+-                            </table>
+-                        </div>
+-                    </div>
+-                </div>
+-            </div>
+-        </div>
+-    </div>
++    <!-- Prediction Table -->
++    <section class="mb-5">
++      <div class="card shadow-sm">
++        <div class="card-header bg-secondary text-white d-flex align-items-center gap-2">
++          <i class="fas fa-table fa-lg"></i>
++          <h5 class="mb-0">Recent Predictions</h5>
++        </div>
++        <div class="card-body table-responsive p-0">
++          <table class="table table-striped table-hover mb-0" aria-describedby="recent-predictions">
++            <thead class="table-light">
++              <tr>
++                <th>Timestamp</th>
++                <th>Risk Level</th>
++                <th>Confidence</th>
++                <th>Classification</th>
++                <th>Key Factors</th>
++              </tr>
++            </thead>
++            <tbody id="predictions-table">
++              <tr>
++                <td colspan="5" class="text-center py-3">Loading predictions...</td>
++              </tr>
++            </tbody>
++          </table>
++        </div>
++      </div>
++    </section>
++  </div>
+ 
+-    <!-- Loading Overlay -->
+-    <div id="loading-overlay" class="loading-overlay">
+-        <div class="loading-spinner">
+-            <i class="fas fa-spinner fa-spin fa-3x"></i>
+-            <p>Loading dashboard...</p>
+-        </div>
+-    </div>
++  <!-- Loading Overlay -->
++  <div id="loading-overlay" class="loading-overlay" aria-hidden="true">
++    <div class="loading-spinner" role="status" aria-live="polite">
++      <i class="fas fa-spinner fa-spin fa-3x"></i>
++      <p class="mt-3 fs-5 text-white">Loading dashboard...</p>
++    </div>
++  </div>
+ 
+-<!-- Zone Status -->
+-<!--<div class="row mb-3">-->
+-<!--  <div class="col-12">-->
+-<!--    <div id="zone-status-bar" class="zone-bar d-flex align-items-center justify-content-center">-->
+-<!--      &lt;!&ndash; Populated dynamically &ndash;&gt;-->
+-<!--    </div>-->
+-<!--  </div>-->
+-<!--</div>-->
+-
+-    <!-- Scripts -->
+-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
+-    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+-<link href="{{ url_for('static', filename='css/dashboard.css') }}" rel="stylesheet" />
+-<script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+-
++  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script>
++  <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+ </body>
++
+ </html>

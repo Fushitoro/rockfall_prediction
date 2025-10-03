@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Prediction Result</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="container">
+    <h2>Prediction Results</h2>
+
+    <div class="result" style="border-left: 5px solid {{ binary_result.color }};">
+        <h3>Binary Risk Prediction</h3>
+        <p><b>Risk Level:</b> {{ binary_result.risk_level }}</p>
+        <p><b>Confidence:</b> {{ binary_result.confidence }}</p>
+        <p><b>Recommendation:</b> {{ binary_result.recommendation }}</p>
+    </div>
+
+    <div class="result">
+        <h3>Multiclass Prediction</h3>
+        <p><b>Category:</b> {{ multiclass_result.prediction_label }}</p>
+        <p><b>Confidence:</b> {{ multiclass_result.confidence }}</p>
+    </div>
+
+    <a href="/">🔙 Back</a>
+</div>
+</body>
+</html>
